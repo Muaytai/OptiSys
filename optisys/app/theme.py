@@ -67,16 +67,20 @@ QLabel#SectionTitle {{
 }}
 
 QPushButton#ActionBtn {{
-    background-color: {BG_CARD};
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #1e293b, stop:1 #151d2a);
     color: {TEXT_PRIMARY};
-    border: 1px solid {BORDER};
+    border: 1px solid #334155;
     border-radius: 8px;
     padding: 7px 14px;
     font-weight: 600;
 }}
 QPushButton#ActionBtn:hover {{
-    background-color: {BG_CARD_HOVER};
-    border-color: {ACCENT};
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2563eb, stop:1 #1d4ed8);
+    border-color: #60a5fa;
+    color: #ffffff;
+}}
+QPushButton#ActionBtn:pressed {{
+    background-color: #1e40af;
 }}
 QPushButton#ActionBtn:disabled {{
     color: {TEXT_MUTED};
@@ -85,18 +89,62 @@ QPushButton#ActionBtn:disabled {{
 }}
 
 QPushButton#PrimaryBtn {{
-    background-color: {ACCENT};
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563eb, stop:0.5 #3b82f6, stop:1 #06b6d4);
     color: #ffffff;
-    border: none;
+    border: 1px solid #60a5fa;
     border-radius: 8px;
-    padding: 8px 16px;
-    font-weight: 600;
+    padding: 8px 18px;
+    font-weight: 700;
 }}
 QPushButton#PrimaryBtn:hover {{
-    background-color: {ACCENT_HOVER};
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1d4ed8, stop:0.5 #2563eb, stop:1 #0891b2);
+    border-color: #93c5fd;
+}}
+QPushButton#PrimaryBtn:pressed {{
+    background-color: #1e40af;
 }}
 QPushButton#PrimaryBtn:disabled {{
     background-color: #1e293b;
+    border-color: #252f42;
+    color: {TEXT_MUTED};
+}}
+
+QPushButton#SuccessBtn {{
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:0.5 #10b981, stop:1 #0d9488);
+    color: #ffffff;
+    border: 1px solid #34d399;
+    border-radius: 8px;
+    padding: 8px 18px;
+    font-weight: 700;
+}}
+QPushButton#SuccessBtn:hover {{
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #047857, stop:0.5 #059669, stop:1 #0f766e);
+    border-color: #6ee7b7;
+}}
+QPushButton#SuccessBtn:pressed {{
+    background-color: #065f46;
+}}
+QPushButton#SuccessBtn:disabled {{
+    background-color: #1e293b;
+    border-color: #252f42;
+    color: {TEXT_MUTED};
+}}
+
+QPushButton#AccentPurpleBtn {{
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6366f1, stop:0.5 #8b5cf6, stop:1 #ec4899);
+    color: #ffffff;
+    border: 1px solid #a78bfa;
+    border-radius: 8px;
+    padding: 8px 18px;
+    font-weight: 700;
+}}
+QPushButton#AccentPurpleBtn:hover {{
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4f46e5, stop:0.5 #7c3aed, stop:1 #db2777);
+    border-color: #c4b5fd;
+}}
+QPushButton#AccentPurpleBtn:disabled {{
+    background-color: #1e293b;
+    border-color: #252f42;
     color: {TEXT_MUTED};
 }}
 

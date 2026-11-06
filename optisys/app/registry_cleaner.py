@@ -134,12 +134,12 @@ def _scan_app_paths(hive_name: str) -> list[RegistryIssue]:
                 issues.append(
                     RegistryIssue(
                         issue_id=issue_id,
-                        category="Пути приложений (App Paths)",
+                        category="Нерабочий ярлык программы",
                         hive_name=hive_name,
                         subkey=full_subkey,
                         value_name="(По умолчанию)",
                         value_data=str(default_val or ""),
-                        reason=f"Исполняемый файл удалён: {exe_path}",
+                        reason=f"Программа была удалена ({exe_path.name if exe_path else app_key_name})",
                     )
                 )
     return issues
@@ -150,49 +150,49 @@ def scan_registry_issues(progress: ProgressCb | None = None) -> list[RegistryIss
     issues: list[RegistryIssue] = []
 
     if progress:
-        progress("Проверка кэша интерфейса MuiCache…")
+        progress("Поиск следов удалённых программ…")
     issues.extend(
         _scan_value_paths(
             "HKCU",
             r"Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache",
-            "Кэш интерфейса (MuiCache)",
-            "Удалена программа",
+            "Следы удалённых программ",
+            "Программа давно удалена",
             check_value_name_as_path=True,
         )
     )
 
     if progress:
-        progress("Проверка путей приложений App Paths…")
+        progress("Проверка ярлыков и путей программ…")
     issues.extend(_scan_app_paths("HKCU"))
     issues.extend(_scan_app_paths("HKLM"))
 
     if progress:
-        progress("Проверка битых ссылок автозагрузки…")
+        progress("Проверка записей автозапуска…")
     issues.extend(
         _scan_value_paths(
             "HKCU",
             r"Software\Microsoft\Windows\CurrentVersion\Run",
-            "Битая автозагрузка",
-            "Файл автозапуска отсутствует",
+            "Удалённая программа в автозапуске",
+            "Файл автозапуска больше не существует",
         )
     )
     issues.extend(
         _scan_value_paths(
             "HKLM",
             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-            "Битая автозагрузка",
-            "Файл автозапуска отсутствует",
+            "Удалённая программа в автозапуске",
+            "Файл автозапуска больше не существует",
         )
     )
 
     if progress:
-        progress("Проверка общих библиотек SharedDLLs…")
+        progress("Проверка отсутствующих библиотек…")
     issues.extend(
         _scan_value_paths(
             "HKLM",
             r"SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs",
-            "Общие библиотеки (SharedDLLs)",
-            "Библиотека отсутствует",
+            "Отсутствующий системный компонент",
+            "Файл библиотеки удалён",
             check_value_name_as_path=True,
         )
     )

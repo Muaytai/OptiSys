@@ -74,6 +74,23 @@ class CleanTarget:
     files_count: int = 0
     size_bytes: int = 0
     checked_by_default: bool = True
+    process_names: tuple[str, ...] = ()
+    min_age_seconds: int = 0
+
+
+@dataclass(slots=True)
+class CleanCategoryResult:
+    """Результат очистки одной категории."""
+
+    key: str
+    title: str
+    freed_bytes: int = 0
+    deleted_count: int = 0
+    skipped_count: int = 0
+    remaining_bytes: int = 0
+    remaining_files: int = 0
+    status: str = ""
+    skipped_reason: str = ""
 
 
 @dataclass(slots=True)
@@ -84,6 +101,7 @@ class CleanSummary:
     deleted_count: int = 0
     skipped_count: int = 0
     details: list[str] = field(default_factory=list)
+    categories: dict[str, CleanCategoryResult] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

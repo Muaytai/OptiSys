@@ -71,7 +71,7 @@ class InstallUpdatesWorker(QThread):
 
 
 class AnalyzeJunkWorker(QThread):
-    progress = Signal(str)
+    progress = Signal(int, int, str, str)
     succeeded = Signal(list)  # list[CleanTarget]
     failed = Signal(str)
 
@@ -84,7 +84,8 @@ class AnalyzeJunkWorker(QThread):
 
 
 class CleanJunkWorker(QThread):
-    progress = Signal(str)
+    progress = Signal(int, int, str, str)
+    log = Signal(str)
     succeeded = Signal(object)  # CleanSummary
     failed = Signal(str)
 
@@ -94,7 +95,7 @@ class CleanJunkWorker(QThread):
 
     def run(self) -> None:
         try:
-            self.succeeded.emit(clean_junk(self._keys, self.progress.emit))
+            self.succeeded.emit(clean_junk(self._keys, self.progress.emit, self.log.emit))
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка очистки мусора")
             self.failed.emit(str(exc))

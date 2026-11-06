@@ -35,13 +35,54 @@ def _set_approved_state(hive: int, approved_subkey: str, name: str, enabled: boo
         winreg.SetValueEx(key, name, 0, winreg.REG_BINARY, payload)
 
 
+def estimate_startup_impact(name: str, command: str) -> str:
+    """Оценивает влияние программы на скорость запуска ПК простыми словами."""
+    combined = f"{name} {command}".lower()
+    high_markers = (
+        "steam",
+        "epicgames",
+        "docker",
+        "discord",
+        "teams",
+        "skype",
+        "onedrive",
+        "yandex",
+        "chrome",
+        "msedge",
+        "firefox",
+        "opera",
+        "adobe",
+        "torrent",
+        "utorrent",
+        "origin",
+        "battle.net",
+        "riot",
+        "spotify",
+    )
+    low_markers = (
+        "securityhealth",
+        "rtkngui",
+        "rthdv",
+        "realtek",
+        "nvbackend",
+        "igfx",
+        "rundll32",
+        "ctfmon",
+    )
+    if any(m in combined for m in high_markers):
+        return "Высокая"
+    if any(m in combined for m in low_markers):
+        return "Низкая"
+    return "Средняя"
+
+
 def list_startup_items() -> list[StartupItem]:
     """Возвращает список программ автозагрузки из реестра (HKCU/HKLM) и папки автозагрузки."""
     items: list[StartupItem] = []
 
     for hive_label, hive in (
-        ("Реестр (Пользователь)", winreg.HKEY_CURRENT_USER),
-        ("Реестр (Система)", winreg.HKEY_LOCAL_MACHINE),
+        ("Для вас (Пользователь)", winreg.HKEY_CURRENT_USER),
+        ("Общая (Система Windows)", winreg.HKEY_LOCAL_MACHINE),
     ):
         try:
             key = winreg.OpenKey(hive, _RUN_KEY, 0, winreg.KEY_READ)
@@ -82,7 +123,7 @@ def list_startup_items() -> list[StartupItem]:
                         item_id=f"dir|{fpath.name}",
                         name=fpath.stem,
                         command=str(fpath),
-                        source="Папка автозагрузки",
+                        source="Ярлык в меню «Пуск»",
                         enabled=enabled,
                         hive=winreg.HKEY_CURRENT_USER,
                         subkey=_APPROVED_FOLDER_KEY,
@@ -127,20 +168,53 @@ def run_optimization_task(key: str) -> OptimizeResult:
     """Выполняет выбранную задачу системной оптимизации."""
     sys_drive = os.environ.get("SystemDrive", "C:")
     if key == "flush_dns":
-        ok, msg = _run_cmd(["ipconfig", "/flushdns"], timeout=30)
-        return OptimizeResult(key, "Сброс кэша DNS", ok, msg)
+        ok, _ = _run_cmd(["ipconfig", "/flushdns"], timeout=30)
+        msg = "Адреса сайтов обновлены — страницы будут открываться быстрее" if ok else "Не удалось обновить кэш адресов"
+        return OptimizeResult(key, "Ускорение интернета и открытия сайтов", ok, msg)
+    if key == "arp_net_cache":
+        ok1, _ = _run_cmd(["ipconfig", "/flushdns"], timeout=30)
+        ok2, _ = _run_cmd(["netsh", "interface", "ip", "delete", "arpcache"], timeout=30)
+        ok = ok1 and ok2
+        msg = (
+            "Сетевые маршруты успешно сброшены и обновлены"
+            if ok
+            else "Для полного сброса сетевых маршрутов запустите программу от имени администратора"
+        )
+        return OptimizeResult(key, "Сброс сетевых задержек и маршрутов", ok, msg)
     if key == "trim_ssd":
-        ok, msg = _run_cmd(["defrag", sys_drive, "/O"], timeout=300)
-        return OptimizeResult(key, f"Оптимизация / TRIM диска {sys_drive}", ok, msg)
+        ok, _ = _run_cmd(["defrag", sys_drive, "/O"], timeout=300)
+        msg = (
+            f"Системный диск {sys_drive} успешно оптимизирован"
+            if ok
+            else "Для оптимизации системного диска требуются права администратора"
+        )
+        return OptimizeResult(key, f"Ускорение работы системного диска ({sys_drive})", ok, msg)
     if key == "winsxs_clean":
-        ok, msg = _run_cmd(
+        ok, _ = _run_cmd(
             ["Dism.exe", "/Online", "/Cleanup-Image", "/StartComponentCleanup"],
             timeout=600,
         )
-        return OptimizeResult(key, "Очистка хранилища компонентов WinSxS", ok, msg)
-    if key == "arp_net_cache":
-        ok1, _ = _run_cmd(["ipconfig", "/flushdns"], timeout=30)
-        ok2, msg2 = _run_cmd(["netsh", "interface", "ip", "delete", "arpcache"], timeout=30)
-        return OptimizeResult(key, "Сброс сетевых таблиц ARP и DNS", ok1 and ok2, msg2)
+        msg = (
+            "Устаревшие копии обновлений Windows удалены"
+            if ok
+            else "Для очистки системного хранилища обновлений нужны права администратора"
+        )
+        return OptimizeResult(key, "Очистка старых копий обновлений Windows", ok, msg)
+    if key == "all_fast":
+        ok_dns, _ = _run_cmd(["ipconfig", "/flushdns"], timeout=30)
+        ok_arp, _ = _run_cmd(["netsh", "interface", "ip", "delete", "arpcache"], timeout=30)
+        ok_ssd, _ = _run_cmd(["defrag", sys_drive, "/O"], timeout=300)
+        done_parts = ["интернет"]
+        if ok_arp:
+            done_parts.append("сеть")
+        if ok_ssd:
+            done_parts.append(f"диск {sys_drive}")
+        return OptimizeResult(
+            key,
+            "Комплексное ускорение ПК в 1 клик",
+            ok_dns,
+            f"Оптимизировано: {', '.join(done_parts)}"
+            + ("" if ok_ssd else " (для ускорения диска нужны права администратора)"),
+        )
     return OptimizeResult(key, key, False, "Неизвестная задача")
 

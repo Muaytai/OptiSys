@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import QSortFilterProxyModel, Qt, QUrl
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QCloseEvent, QColor, QDesktopServices, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .cleaner import catalog_definitions
 from .models import (
     CleanSummary,
     CleanTarget,
@@ -40,7 +41,8 @@ from .models import (
     StartupItem,
     SystemReport,
 )
-from .optimizer import list_startup_items, set_startup_item_enabled
+from .optimizer import estimate_startup_impact, list_startup_items, set_startup_item_enabled
+from .registry_cleaner import extract_executable_path
 from .report import export_html, export_json
 from .theme import ACCENT, APP_STYLESHEET, DANGER, SUCCESS, TEXT_SECONDARY, WARNING
 from .utils import fmt_bytes, is_admin, relaunch_as_admin
@@ -402,17 +404,17 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
         # Сводные карточки очистки
         cards = QGridLayout()
         cards.setSpacing(12)
         self.card_junk_found = HeroCard("cleaner", "Обнаружено мусора", WARNING)
-        self.card_junk_found.set_content("Не проверено", "Нажмите «Анализировать»")
+        self.card_junk_found.set_content("Не проверено", "Нажмите «Анализировать систему»")
         self.card_junk_selected = HeroCard("disks", "Выбрано к очистке", ACCENT)
         self.card_junk_selected.set_content("0 Б", "Отметьте нужные категории")
         self.card_junk_freed = HeroCard("optimize", "Освобождено за сессию", SUCCESS)
-        self.card_junk_freed.set_content("0 Б", "Безопасное удаление кэша и Temp")
+        self.card_junk_freed.set_content("0 Б", "Безопасное удаление кэша и старых Temp")
 
         cards.addWidget(self.card_junk_found, 0, 0)
         cards.addWidget(self.card_junk_selected, 0, 1)
@@ -421,15 +423,36 @@ class MainWindow(QMainWindow):
             cards.setColumnStretch(c, 1)
         layout.addLayout(cards)
 
-        # Панель действий
+        # Панель действий и управления выбором (CCleaner Pro style)
         bar = QFrame()
         bar.setObjectName("Card")
-        bar_layout = QHBoxLayout(bar)
-        bar_layout.setContentsMargins(16, 12, 16, 12)
-        bar_layout.setSpacing(12)
+        bar_outer = QVBoxLayout(bar)
+        bar_outer.setContentsMargins(16, 12, 16, 12)
+        bar_outer.setSpacing(10)
 
-        lbl_hint = QLabel("Пароли, куки, открытые вкладки браузеров и системные библиотеки не затрагиваются.")
+        bar_layout = QHBoxLayout()
+        bar_layout.setSpacing(10)
+
+        lbl_hint = QLabel(
+            "🛡 Активные сессии, куки, пароли и файлы моложе 24 ч в %TEMP% защищены."
+        )
         lbl_hint.setObjectName("MutedLabel")
+
+        self.btn_sel_rec = QPushButton("✔ Рекомендуемые")
+        self.btn_sel_rec.setObjectName("ActionBtn")
+        self.btn_sel_rec.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sel_rec.setToolTip("Выбрать только безопасные системные категории (без браузеров и кэша пакетов)")
+        self.btn_sel_rec.clicked.connect(lambda: self._select_cleaner_preset("recommended"))
+
+        self.btn_sel_all = QPushButton("☑ Выбрать все")
+        self.btn_sel_all.setObjectName("ActionBtn")
+        self.btn_sel_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sel_all.clicked.connect(lambda: self._select_cleaner_preset("all"))
+
+        self.btn_sel_none = QPushButton("☐ Снять выбор")
+        self.btn_sel_none.setObjectName("ActionBtn")
+        self.btn_sel_none.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sel_none.clicked.connect(lambda: self._select_cleaner_preset("none"))
 
         self.btn_analyze_junk = QPushButton("🔍 Анализировать систему")
         self.btn_analyze_junk.setObjectName("PrimaryBtn")
@@ -437,20 +460,31 @@ class MainWindow(QMainWindow):
         self.btn_analyze_junk.clicked.connect(self.start_analyze_junk)
 
         self.btn_clean_junk = QPushButton("🧹 Очистить выбранное")
-        self.btn_clean_junk.setObjectName("ActionBtn")
+        self.btn_clean_junk.setObjectName("SuccessBtn")
         self.btn_clean_junk.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_clean_junk.setEnabled(False)
         self.btn_clean_junk.clicked.connect(self.start_clean_junk)
 
         bar_layout.addWidget(lbl_hint, stretch=1)
+        bar_layout.addWidget(self.btn_sel_rec)
+        bar_layout.addWidget(self.btn_sel_all)
+        bar_layout.addWidget(self.btn_sel_none)
         bar_layout.addWidget(self.btn_analyze_junk)
         bar_layout.addWidget(self.btn_clean_junk)
+        bar_outer.addLayout(bar_layout)
+
+        # Визуальный прогресс-бар анализа и очистки
+        self.cleaner_progress = QProgressBar()
+        self.cleaner_progress.setTextVisible(True)
+        self.cleaner_progress.hide()
+        bar_outer.addWidget(self.cleaner_progress)
+
         layout.addWidget(bar)
 
         # Таблица категорий
         self.cleaner_model = QStandardItemModel(self)
         self.cleaner_model.setHorizontalHeaderLabels(
-            ["Категория", "Группа", "Описание", "Файлов", "Размер"]
+            ["Категория", "Группа", "Описание", "Файлов", "Размер", "Статус / Результат"]
         )
         self.cleaner_model.itemChanged.connect(self._recalc_selected_junk)
 
@@ -461,10 +495,22 @@ class MainWindow(QMainWindow):
         self.cleaner_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.cleaner_view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.cleaner_view.verticalHeader().setVisible(False)
-        self.cleaner_view.verticalHeader().setDefaultSectionSize(34)
-        self.cleaner_view.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.cleaner_view.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(self.cleaner_view, stretch=1)
+        self.cleaner_view.verticalHeader().setDefaultSectionSize(36)
+        self.cleaner_view.horizontalHeader().setStretchLastSection(True)
+        self.cleaner_view.horizontalHeader().setHighlightSections(False)
+        layout.addWidget(self.cleaner_view, stretch=3)
+
+        # Журнал операций очистки (как детальный отчёт в CCleaner Pro)
+        self.cleaner_log = QPlainTextEdit()
+        self.cleaner_log.setReadOnly(True)
+        self.cleaner_log.setPlaceholderText(
+            "Детальный журнал анализа и очистки (здесь отображается ход выполнения по каждой категории)…"
+        )
+        self.cleaner_log.setMaximumHeight(125)
+        self.cleaner_log.setMaximumBlockCount(1000)
+        layout.addWidget(self.cleaner_log)
+
+        self._populate_initial_cleaner_catalog()
         return page
 
     # ---------- Страница «Оптимизация» (Реестр + Автозагрузка + Твики) ----------
@@ -473,9 +519,9 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
-        # Быстрые действия оптимизации (1-клик)
+        # Верхний блок: Наглядные карточки ускорения ПК (понятно для любого пользователя)
         quick_card = QFrame()
         quick_card.setObjectName("Card")
         quick_layout = QVBoxLayout(quick_card)
@@ -483,58 +529,124 @@ class MainWindow(QMainWindow):
         quick_layout.setSpacing(10)
 
         q_hdr = QHBoxLayout()
-        q_title = QLabel("⚡ Быстрая оптимизация системы")
-        q_title.setStyleSheet("font-size: 14px; font-weight: 700;")
-        self.opt_status_lbl = QLabel("Выберите задачу для ускорения и обслуживания ОС")
+        q_title = QLabel("⚡ Ускорение работы компьютера и интернета")
+        q_title.setStyleSheet("font-size: 15px; font-weight: 700;")
+        self.opt_status_lbl = QLabel("Выберите действие ниже или нажмите «Ускорить всё в 1 клик»")
         self.opt_status_lbl.setObjectName("MutedLabel")
+
+        self.btn_opt_all = QPushButton("🚀 Ускорить всё в 1 клик")
+        self.btn_opt_all.setObjectName("AccentPurpleBtn")
+        self.btn_opt_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_opt_all.setToolTip("Выполнить быструю настройку интернета, сети и системного диска")
+        self.btn_opt_all.clicked.connect(lambda: self.start_optimize_task("all_fast"))
+
         q_hdr.addWidget(q_title)
         q_hdr.addStretch(1)
         q_hdr.addWidget(self.opt_status_lbl)
+        q_hdr.addSpacing(10)
+        q_hdr.addWidget(self.btn_opt_all)
         quick_layout.addLayout(q_hdr)
 
-        q_btns = QHBoxLayout()
-        q_btns.setSpacing(10)
-        self._opt_buttons: list[QPushButton] = []
-        for task_key, btn_text, tooltip in (
-            ("flush_dns", "🌐 Сбросить кэш DNS", "ipconfig /flushdns — очистка кэша DNS-резолвера"),
-            ("arp_net_cache", "📡 Сбросить сетевой кэш ARP", "Очистка таблиц маршрутизации ARP и DNS"),
-            ("trim_ssd", "🚀 Оптимизация / TRIM диска C:", "defrag C: /O — выполнение TRIM для SSD или оптимизации диска"),
-            ("winsxs_clean", "📦 Очистка пакетов WinSxS", "DISM /StartComponentCleanup — очистка устаревших версий компонентов"),
-        ):
-            btn = QPushButton(btn_text)
-            btn.setObjectName("ActionBtn")
+        cards_row = QGridLayout()
+        cards_row.setSpacing(10)
+        self._opt_buttons: list[QPushButton] = [self.btn_opt_all]
+        self._opt_card_status: dict[str, QLabel] = {}
+
+        opt_specs = [
+            (
+                "flush_dns",
+                "🌐 Ускорение интернета",
+                "Обновляет адреса сайтов. Помогает, если страницы долго загружаются или не открываются.",
+                "Ускорить браузер и сайты",
+                "PrimaryBtn",
+            ),
+            (
+                "arp_net_cache",
+                "📡 Сброс сетевых задержек",
+                "Очищает старые сетевые маршруты роутера для стабильной связи в онлайн-играх и звонках.",
+                "Обновить сеть",
+                "PrimaryBtn",
+            ),
+            (
+                "trim_ssd",
+                "💽 Ускорение диска (SSD)",
+                "Восстанавливает скорость чтения и записи системного диска C: и продлевает срок его службы.",
+                "Ускорить диск C:",
+                "SuccessBtn",
+            ),
+            (
+                "winsxs_clean",
+                "📦 Очистка старых обновлений",
+                "Удаляет ненужные резервные копии прошлых обновлений Windows (занимает 2–5 минут).",
+                "Очистить обновления",
+                "ActionBtn",
+            ),
+        ]
+
+        for col, (task_key, title_txt, desc_txt, btn_txt, btn_style) in enumerate(opt_specs):
+            item_frame = QFrame()
+            item_frame.setObjectName("CardHover")
+            item_v = QVBoxLayout(item_frame)
+            item_v.setContentsMargins(12, 10, 12, 10)
+            item_v.setSpacing(6)
+
+            lbl_t = QLabel(title_txt)
+            lbl_t.setStyleSheet("font-size: 13px; font-weight: 700;")
+            item_v.addWidget(lbl_t)
+
+            lbl_d = QLabel(desc_txt)
+            lbl_d.setObjectName("MutedLabel")
+            lbl_d.setWordWrap(True)
+            item_v.addWidget(lbl_d, stretch=1)
+
+            st_lbl = QLabel("Готово к запуску")
+            st_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
+            item_v.addWidget(st_lbl)
+            self._opt_card_status[task_key] = st_lbl
+
+            btn = QPushButton(btn_txt)
+            btn.setObjectName(btn_style)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setToolTip(tooltip)
             btn.clicked.connect(lambda _=False, k=task_key: self.start_optimize_task(k))
-            q_btns.addWidget(btn)
+            item_v.addWidget(btn)
             self._opt_buttons.append(btn)
-        quick_layout.addLayout(q_btns)
+
+            cards_row.addWidget(item_frame, 0, col)
+            cards_row.setColumnStretch(col, 1)
+
+        quick_layout.addLayout(cards_row)
+
+        self.opt_progress = QProgressBar()
+        self.opt_progress.setTextVisible(True)
+        self.opt_progress.hide()
+        quick_layout.addWidget(self.opt_progress)
+
         layout.addWidget(quick_card)
 
-        # Нижний сплит: слева Реестр, справа Автозагрузка
+        # Нижний сплит: слева Исправление ошибок Windows (Реестр), справа Программы при включении (Автозагрузка)
         split = QHBoxLayout()
         split.setSpacing(14)
 
-        # --- Левая колонка: Очистка реестра ---
+        # --- Левая колонка: Безопасная очистка реестра ---
         reg_card = QFrame()
         reg_card.setObjectName("Card")
         reg_layout = QVBoxLayout(reg_card)
         reg_layout.setContentsMargins(16, 14, 16, 14)
-        reg_layout.setSpacing(10)
+        reg_layout.setSpacing(8)
 
         reg_hdr = QHBoxLayout()
-        reg_title = QLabel("🛡 Очистка реестра (авто-бэкап .reg)")
+        reg_title = QLabel("🛡 Устранение следов удалённых программ")
         reg_title.setStyleSheet("font-size: 14px; font-weight: 700;")
         reg_hdr.addWidget(reg_title)
         reg_hdr.addStretch(1)
 
-        self.btn_reg_scan = QPushButton("🔍 Проверить реестр")
+        self.btn_reg_scan = QPushButton("🔍 Найти ошибки")
         self.btn_reg_scan.setObjectName("PrimaryBtn")
         self.btn_reg_scan.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_reg_scan.clicked.connect(self.start_scan_registry)
 
-        self.btn_reg_fix = QPushButton("🛠 Исправить выбранные")
-        self.btn_reg_fix.setObjectName("ActionBtn")
+        self.btn_reg_fix = QPushButton("✨ Исправить выбранные")
+        self.btn_reg_fix.setObjectName("SuccessBtn")
         self.btn_reg_fix.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_reg_fix.setEnabled(False)
         self.btn_reg_fix.clicked.connect(self.start_fix_registry)
@@ -543,8 +655,15 @@ class MainWindow(QMainWindow):
         reg_hdr.addWidget(self.btn_reg_fix)
         reg_layout.addLayout(reg_hdr)
 
+        self.reg_status_lbl = QLabel(
+            "Ищет оставшиеся записи от давно удалённых игр и программ. Перед очисткой создаётся резервная копия."
+        )
+        self.reg_status_lbl.setObjectName("MutedLabel")
+        self.reg_status_lbl.setWordWrap(True)
+        reg_layout.addWidget(self.reg_status_lbl)
+
         self.reg_model = QStandardItemModel(self)
-        self.reg_model.setHorizontalHeaderLabels(["Категория", "Раздел / Параметр", "Причина"])
+        self.reg_model.setHorizontalHeaderLabels(["Тип проблемы", "Программа / Файл", "Что обнаружено"])
         self.reg_view = QTableView()
         self.reg_view.setModel(self.reg_model)
         self.reg_view.setAlternatingRowColors(True)
@@ -552,36 +671,44 @@ class MainWindow(QMainWindow):
         self.reg_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.reg_view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.reg_view.verticalHeader().setVisible(False)
-        self.reg_view.verticalHeader().setDefaultSectionSize(32)
-        self.reg_view.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.reg_view.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.reg_view.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.reg_view.verticalHeader().setDefaultSectionSize(34)
+        self.reg_view.horizontalHeader().setStretchLastSection(True)
+        self.reg_view.horizontalHeader().setHighlightSections(False)
         reg_layout.addWidget(self.reg_view, stretch=1)
 
         split.addWidget(reg_card, stretch=6)
 
-        # --- Правая колонка: Менеджер автозагрузки ---
+        # --- Правая колонка: Программы при включении ПК ---
         st_card = QFrame()
         st_card.setObjectName("Card")
         st_layout = QVBoxLayout(st_card)
         st_layout.setContentsMargins(16, 14, 16, 14)
-        st_layout.setSpacing(10)
+        st_layout.setSpacing(8)
 
         st_hdr = QHBoxLayout()
-        st_title = QLabel("🚀 Автозагрузка Windows")
+        st_title = QLabel("🚀 Программы при включении компьютера")
         st_title.setStyleSheet("font-size: 14px; font-weight: 700;")
         st_hdr.addWidget(st_title)
         st_hdr.addStretch(1)
 
-        self.btn_st_refresh = QPushButton("🔄 Обновить")
+        self.btn_st_refresh = QPushButton("🔄 Обновить список")
         self.btn_st_refresh.setObjectName("ActionBtn")
         self.btn_st_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_st_refresh.clicked.connect(self.refresh_startup_items)
         st_hdr.addWidget(self.btn_st_refresh)
         st_layout.addLayout(st_hdr)
 
+        st_sub = QLabel(
+            "Снимите галочку с программ, которые не нужны сразу после включения ПК — компьютер будет загружаться быстрее."
+        )
+        st_sub.setObjectName("MutedLabel")
+        st_sub.setWordWrap(True)
+        st_layout.addWidget(st_sub)
+
         self.startup_model = QStandardItemModel(self)
-        self.startup_model.setHorizontalHeaderLabels(["Программа", "Источник", "Команда"])
+        self.startup_model.setHorizontalHeaderLabels(
+            ["Программа", "Автозапуск", "Нагрузка на старт", "Где настроено"]
+        )
         self.startup_model.itemChanged.connect(self._on_startup_item_toggled)
 
         self.startup_view = QTableView()
@@ -591,10 +718,9 @@ class MainWindow(QMainWindow):
         self.startup_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.startup_view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.startup_view.verticalHeader().setVisible(False)
-        self.startup_view.verticalHeader().setDefaultSectionSize(32)
-        self.startup_view.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.startup_view.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.startup_view.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.startup_view.verticalHeader().setDefaultSectionSize(34)
+        self.startup_view.horizontalHeader().setStretchLastSection(True)
+        self.startup_view.horizontalHeader().setHighlightSections(False)
         st_layout.addWidget(self.startup_view, stretch=1)
 
         split.addWidget(st_card, stretch=5)
@@ -843,20 +969,107 @@ class MainWindow(QMainWindow):
 
     # ---------- Логика очистки мусора ----------
 
+    def _populate_initial_cleaner_catalog(self) -> None:
+        """Заполняет таблицу категорий очистки сразу при открытии, до запуска анализа."""
+        self.cleaner_model.blockSignals(True)
+        self.cleaner_model.removeRows(0, self.cleaner_model.rowCount())
+        for t in catalog_definitions():
+            item_title = QStandardItem(t.title)
+            item_title.setCheckable(True)
+            item_title.setCheckState(
+                Qt.CheckState.Checked if t.checked_by_default else Qt.CheckState.Unchecked
+            )
+            item_title.setData(t.key, Qt.ItemDataRole.UserRole)
+            item_title.setData(0, Qt.ItemDataRole.UserRole + 1)
+            item_title.setData(0, Qt.ItemDataRole.UserRole + 2)
+            item_title.setData(t.checked_by_default, Qt.ItemDataRole.UserRole + 3)
+
+            status_item = QStandardItem("Нажмите «Анализировать систему»")
+            status_item.setForeground(QColor(TEXT_SECONDARY))
+
+            self.cleaner_model.appendRow([
+                item_title,
+                QStandardItem(t.group),
+                QStandardItem(t.description),
+                QStandardItem("—"),
+                QStandardItem("—"),
+                status_item,
+            ])
+        self.cleaner_model.blockSignals(False)
+        self._resize_cleaner_columns()
+
+    def _resize_cleaner_columns(self) -> None:
+        self.cleaner_view.setColumnWidth(0, 290)
+        self.cleaner_view.setColumnWidth(1, 165)
+        self.cleaner_view.setColumnWidth(2, 340)
+        self.cleaner_view.setColumnWidth(3, 85)
+        self.cleaner_view.setColumnWidth(4, 95)
+
+    def _select_cleaner_preset(self, mode: str) -> None:
+        self.cleaner_model.blockSignals(True)
+        for row in range(self.cleaner_model.rowCount()):
+            it = self.cleaner_model.item(row, 0)
+            if not it:
+                continue
+            sz = int(it.data(Qt.ItemDataRole.UserRole + 1) or 0)
+            rec = bool(it.data(Qt.ItemDataRole.UserRole + 3))
+            if mode == "all":
+                state = Qt.CheckState.Checked if (sz > 0 or not self._clean_targets) else Qt.CheckState.Unchecked
+            elif mode == "recommended":
+                state = Qt.CheckState.Checked if (rec and (sz > 0 or not self._clean_targets)) else Qt.CheckState.Unchecked
+            else:
+                state = Qt.CheckState.Unchecked
+            it.setCheckState(state)
+        self.cleaner_model.blockSignals(False)
+        self._recalc_selected_junk()
+
+    def _cleaner_log_append(self, text: str) -> None:
+        self.cleaner_log.appendPlainText(text)
+
+    def _set_cleaner_row_status(self, key: str, status_text: str, color: str | None = None) -> None:
+        for row in range(self.cleaner_model.rowCount()):
+            it = self.cleaner_model.item(row, 0)
+            if it and it.data(Qt.ItemDataRole.UserRole) == key:
+                st_it = self.cleaner_model.item(row, 5)
+                if st_it:
+                    st_it.setText(status_text)
+                    if color:
+                        st_it.setForeground(QColor(color))
+                self.cleaner_view.scrollTo(self.cleaner_model.index(row, 0))
+                break
+
     def start_analyze_junk(self) -> None:
         if self._analyze_worker and self._analyze_worker.isRunning():
             return
         self.btn_analyze_junk.setEnabled(False)
         self.btn_clean_junk.setEnabled(False)
         self.spinner.start()
+        self.cleaner_progress.setRange(0, len(catalog_definitions()))
+        self.cleaner_progress.setValue(0)
+        self.cleaner_progress.setFormat("Анализ категорий мусора… (%p%)")
+        self.cleaner_progress.show()
+        self._cleaner_log_append("🔍 Запущен анализ временных файлов и кэша…")
         self.status_title.setText("Анализ временных файлов и кэша…")
 
         self._analyze_worker = AnalyzeJunkWorker()
-        self._analyze_worker.progress.connect(self.status_title.setText)
+        self._analyze_worker.progress.connect(self._on_analyze_progress)
         self._analyze_worker.succeeded.connect(self._on_analyze_done)
-        self._analyze_worker.failed.connect(lambda msg: QMessageBox.critical(self, "Анализ", msg))
+        self._analyze_worker.failed.connect(self._on_analyze_failed)
         self._analyze_worker.finished.connect(self._on_analyze_finished)
         self._analyze_worker.start()
+
+    def _on_analyze_progress(self, current: int, total: int, key: str, message: str) -> None:
+        self.cleaner_progress.setRange(0, max(total, 1))
+        self.cleaner_progress.setValue(current)
+        self.cleaner_progress.setFormat(f"{message}  ({current}/{total})")
+        self.status_title.setText(message)
+        if key:
+            self._set_cleaner_row_status(key, "⏳ Сканирование…", ACCENT)
+
+    def _on_analyze_failed(self, msg: str) -> None:
+        self.cleaner_progress.hide()
+        self._cleaner_log_append(f"✖ Ошибка анализа: {msg}")
+        QMessageBox.critical(self, "Анализ", msg)
 
     def _on_analyze_finished(self) -> None:
         self.btn_analyze_junk.setEnabled(True)
@@ -864,6 +1077,19 @@ class MainWindow(QMainWindow):
 
     def _on_analyze_done(self, targets: list[CleanTarget]) -> None:
         self._clean_targets = targets
+        self.cleaner_progress.setValue(self.cleaner_progress.maximum())
+        self.cleaner_progress.setFormat("✔ Анализ завершён (100%)")
+
+        # Сохраняем текущий выбор пользователя, если он уже переключал чекбоксы
+        prev_checked: dict[str, bool] = {}
+        if self._clean_targets:
+            for row in range(self.cleaner_model.rowCount()):
+                it = self.cleaner_model.item(row, 0)
+                if it:
+                    prev_checked[str(it.data(Qt.ItemDataRole.UserRole))] = (
+                        it.checkState() == Qt.CheckState.Checked
+                    )
+
         self.cleaner_model.blockSignals(True)
         self.cleaner_model.removeRows(0, self.cleaner_model.rowCount())
         total_bytes = 0
@@ -873,11 +1099,27 @@ class MainWindow(QMainWindow):
             total_files += t.files_count
             item_title = QStandardItem(t.title)
             item_title.setCheckable(True)
-            state = Qt.CheckState.Checked if (t.checked_by_default and t.size_bytes > 0) else Qt.CheckState.Unchecked
+            want_check = prev_checked.get(t.key, t.checked_by_default)
+            state = Qt.CheckState.Checked if (want_check and t.size_bytes > 0) else Qt.CheckState.Unchecked
             item_title.setCheckState(state)
             item_title.setData(t.key, Qt.ItemDataRole.UserRole)
             item_title.setData(t.size_bytes, Qt.ItemDataRole.UserRole + 1)
             item_title.setData(t.files_count, Qt.ItemDataRole.UserRole + 2)
+            item_title.setData(t.checked_by_default, Qt.ItemDataRole.UserRole + 3)
+
+            if t.size_bytes > 0:
+                status_txt = (
+                    f"Найдено {fmt_bytes(t.size_bytes)} (готово к очистке)"
+                    if state == Qt.CheckState.Checked
+                    else f"Найдено {fmt_bytes(t.size_bytes)} (отметьте при необходимости)"
+                )
+                status_color = WARNING if state == Qt.CheckState.Checked else TEXT_SECONDARY
+            else:
+                status_txt = "✔ Чисто"
+                status_color = SUCCESS
+
+            status_it = QStandardItem(status_txt)
+            status_it.setForeground(QColor(status_color))
 
             self.cleaner_model.appendRow([
                 item_title,
@@ -885,15 +1127,19 @@ class MainWindow(QMainWindow):
                 QStandardItem(t.description),
                 QStandardItem(str(t.files_count)),
                 QStandardItem(fmt_bytes(t.size_bytes) or "0 Б"),
+                status_it,
             ])
         self.cleaner_model.blockSignals(False)
+        self._resize_cleaner_columns()
 
         self.card_junk_found.set_content(
             fmt_bytes(total_bytes) or "0 Б",
             f"Всего файлов и объектов: {total_files}",
         )
         self._recalc_selected_junk()
-        self.status_title.setText(f"Анализ завершён · Найдено {fmt_bytes(total_bytes) or '0 Б'}")
+        summary_msg = f"Анализ завершён · Найдено {fmt_bytes(total_bytes) or '0 Б'} ({total_files} объектов)"
+        self.status_title.setText(summary_msg)
+        self._cleaner_log_append(f"✔ {summary_msg}")
 
     def _recalc_selected_junk(self) -> None:
         sel_bytes = 0
@@ -909,7 +1155,7 @@ class MainWindow(QMainWindow):
             fmt_bytes(sel_bytes) or "0 Б",
             f"Категорий: {len(sel_keys)} · Файлов: {sel_files}",
         )
-        self.btn_clean_junk.setEnabled(bool(sel_keys))
+        self.btn_clean_junk.setEnabled(bool(sel_keys) and sel_bytes > 0)
 
     def start_clean_junk(self) -> None:
         if self._clean_worker and self._clean_worker.isRunning():
@@ -921,42 +1167,107 @@ class MainWindow(QMainWindow):
                 keys.append(it.data(Qt.ItemDataRole.UserRole))
         if not keys:
             return
-        ans = QMessageBox.question(
-            self,
-            "Подтверждение очистки",
-            f"Очистить выбранные категории ({len(keys)})?\nЗанятые открытыми программами файлы будут безопасно пропущены.",
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
 
         self.btn_analyze_junk.setEnabled(False)
         self.btn_clean_junk.setEnabled(False)
         self.spinner.start()
+        self.cleaner_progress.setRange(0, len(keys))
+        self.cleaner_progress.setValue(0)
+        self.cleaner_progress.setFormat("Подготовка к очистке…")
+        self.cleaner_progress.show()
+        self._cleaner_log_append(f"🧹 Запуск очистки выбранных категорий ({len(keys)})…")
         self.status_title.setText("Очистка выбранных категорий…")
 
         self._clean_worker = CleanJunkWorker(keys)
-        self._clean_worker.progress.connect(self.status_title.setText)
+        self._clean_worker.progress.connect(self._on_clean_progress)
+        self._clean_worker.log.connect(self._cleaner_log_append)
         self._clean_worker.succeeded.connect(self._on_clean_done)
-        self._clean_worker.failed.connect(lambda msg: QMessageBox.critical(self, "Очистка", msg))
+        self._clean_worker.failed.connect(self._on_clean_failed)
         self._clean_worker.finished.connect(self._on_analyze_finished)
         self._clean_worker.start()
+
+    def _on_clean_progress(self, current: int, total: int, key: str, message: str) -> None:
+        self.cleaner_progress.setRange(0, max(total, 1))
+        self.cleaner_progress.setValue(current)
+        self.cleaner_progress.setFormat(f"{message}  ({current}/{total})")
+        self.status_title.setText(message)
+        if key:
+            self._set_cleaner_row_status(key, "⏳ Очистка…", ACCENT)
+
+    def _on_clean_failed(self, msg: str) -> None:
+        self.cleaner_progress.hide()
+        self._cleaner_log_append(f"✖ Ошибка очистки: {msg}")
+        QMessageBox.critical(self, "Очистка", msg)
 
     def _on_clean_done(self, summary: CleanSummary) -> None:
         self._session_freed_bytes += summary.freed_bytes
         self.card_junk_freed.set_content(
             fmt_bytes(self._session_freed_bytes) or "0 Б",
-            f"Удалено объектов: {summary.deleted_count} (пропущено активных: {summary.skipped_count})",
+            f"За запуск удалено: {summary.deleted_count} ф. (активных пропущено: {summary.skipped_count})",
         )
-        QMessageBox.information(
-            self,
-            "Очистка завершена",
-            f"Освобождено: {fmt_bytes(summary.freed_bytes) or '0 Б'}\n"
-            f"Удалено файлов: {summary.deleted_count}\n"
-            f"Занято процессами (пропущено): {summary.skipped_count}",
+        self.cleaner_progress.setValue(self.cleaner_progress.maximum())
+        self.cleaner_progress.setFormat(
+            f"✔ Очистка завершена · Освобождено {fmt_bytes(summary.freed_bytes) or '0 Б'}"
         )
-        self.start_analyze_junk()
+
+        # Обновляем таблицу на месте без сброса статусов результатов
+        self.cleaner_model.blockSignals(True)
+        rem_total_bytes = 0
+        rem_total_files = 0
+        for row in range(self.cleaner_model.rowCount()):
+            it = self.cleaner_model.item(row, 0)
+            if not it:
+                continue
+            key = str(it.data(Qt.ItemDataRole.UserRole))
+            cat_res = summary.categories.get(key)
+            if cat_res is not None:
+                it.setData(cat_res.remaining_bytes, Qt.ItemDataRole.UserRole + 1)
+                it.setData(cat_res.remaining_files, Qt.ItemDataRole.UserRole + 2)
+                if cat_res.remaining_bytes == 0 or cat_res.deleted_count > 0:
+                    it.setCheckState(Qt.CheckState.Unchecked)
+                cnt_it = self.cleaner_model.item(row, 3)
+                sz_it = self.cleaner_model.item(row, 4)
+                st_it = self.cleaner_model.item(row, 5)
+                if cnt_it:
+                    cnt_it.setText(str(cat_res.remaining_files))
+                if sz_it:
+                    sz_it.setText(fmt_bytes(cat_res.remaining_bytes) or "0 Б")
+                if st_it:
+                    st_it.setText(cat_res.status)
+                    color = SUCCESS if cat_res.status.startswith("✔") else WARNING
+                    st_it.setForeground(QColor(color))
+
+            rem_total_bytes += int(it.data(Qt.ItemDataRole.UserRole + 1) or 0)
+            rem_total_files += int(it.data(Qt.ItemDataRole.UserRole + 2) or 0)
+        self.cleaner_model.blockSignals(False)
+
+        self.card_junk_found.set_content(
+            fmt_bytes(rem_total_bytes) or "0 Б",
+            f"Осталось невыбранных/занятых объектов: {rem_total_files}",
+        )
+        self._recalc_selected_junk()
+        done_msg = (
+            f"Очистка завершена · Освобождено {fmt_bytes(summary.freed_bytes) or '0 Б'} "
+            f"(удалено {summary.deleted_count}, занято процессами: {summary.skipped_count})"
+        )
+        self.status_title.setText(done_msg)
+        self._cleaner_log_append(f"🏁 {done_msg}")
 
     # ---------- Логика реестра, автозагрузки и оптимизации ----------
+
+    @staticmethod
+    def _friendly_registry_target(iss: RegistryIssue) -> tuple[str, str]:
+        """Возвращает понятное имя программы/файла и простую причину для таблицы реестра."""
+        raw = iss.value_data if iss.value_name in ("(По умолчанию)", "") else f"{iss.value_name} {iss.value_data}"
+        exe = extract_executable_path(iss.value_name) or extract_executable_path(iss.value_data)
+        if exe is not None:
+            prog_name = exe.name
+            if iss.value_data and not iss.value_data.startswith(("C:", "D:", "E:", '"')) and len(iss.value_data) < 48:
+                prog_name = f"{iss.value_data} ({exe.name})"
+            reason = f"Файл программы удалён ({exe})"
+            return prog_name, reason
+        fallback = iss.value_name if iss.value_name != "(По умолчанию)" else iss.subkey.rsplit("\\", 1)[-1]
+        return fallback, iss.reason
 
     def start_scan_registry(self) -> None:
         if self._reg_scan_worker and self._reg_scan_worker.isRunning():
@@ -964,12 +1275,13 @@ class MainWindow(QMainWindow):
         self.btn_reg_scan.setEnabled(False)
         self.btn_reg_fix.setEnabled(False)
         self.spinner.start()
-        self.status_title.setText("Проверка реестра на битые ссылки…")
+        self.reg_status_lbl.setText("⏳ Поиск оставшихся следов удалённых программ и нерабочих ярлыков…")
+        self.status_title.setText("Поиск следов удалённых программ…")
 
         self._reg_scan_worker = ScanRegistryWorker()
         self._reg_scan_worker.progress.connect(self.status_title.setText)
         self._reg_scan_worker.succeeded.connect(self._on_reg_scan_done)
-        self._reg_scan_worker.failed.connect(lambda msg: QMessageBox.critical(self, "Реестр", msg))
+        self._reg_scan_worker.failed.connect(lambda msg: QMessageBox.critical(self, "Проверка", msg))
         self._reg_scan_worker.finished.connect(self._on_reg_scan_finished)
         self._reg_scan_worker.start()
 
@@ -986,14 +1298,28 @@ class MainWindow(QMainWindow):
             cat_item.setCheckable(True)
             cat_item.setCheckState(Qt.CheckState.Checked)
             cat_item.setData(iss.issue_id, Qt.ItemDataRole.UserRole)
-            key_display = f"{iss.hive_name}\\{iss.subkey} → {iss.value_name}"
-            self.reg_model.appendRow([
-                cat_item,
-                QStandardItem(key_display),
-                QStandardItem(iss.reason),
-            ])
+
+            friendly_prog, friendly_reason = self._friendly_registry_target(iss)
+            tech_tooltip = f"Раздел: {iss.hive_name}\\{iss.subkey}\nПараметр: {iss.value_name}\nЗначение: {iss.value_data}"
+            prog_item = QStandardItem(friendly_prog)
+            reason_item = QStandardItem(friendly_reason)
+            for cell in (cat_item, prog_item, reason_item):
+                cell.setToolTip(tech_tooltip)
+
+            self.reg_model.appendRow([cat_item, prog_item, reason_item])
+
+        self.reg_view.setColumnWidth(0, 210)
+        self.reg_view.setColumnWidth(1, 210)
         self.btn_reg_fix.setEnabled(bool(issues))
-        self.status_title.setText(f"Проверка реестра завершена · Найдено записей: {len(issues)}")
+        if issues:
+            self.reg_status_lbl.setText(
+                f"⚠ Найдено ненужных записей от удалённых программ: {len(issues)}. Нажмите «Исправить выбранные»."
+            )
+            self.reg_status_lbl.setStyleSheet(f"color: {WARNING}; font-size: 12px; font-weight: 600;")
+        else:
+            self.reg_status_lbl.setText("✔ Всё в порядке! Следов удалённых программ и ошибок не обнаружено.")
+            self.reg_status_lbl.setStyleSheet(f"color: {SUCCESS}; font-size: 12px; font-weight: 600;")
+        self.status_title.setText(f"Проверка завершена · Найдено записей: {len(issues)}")
 
     def start_fix_registry(self) -> None:
         if self._reg_fix_worker and self._reg_fix_worker.isRunning():
@@ -1005,30 +1331,23 @@ class MainWindow(QMainWindow):
                 selected.append(it.data(Qt.ItemDataRole.UserRole))
         if not selected:
             return
-        ans = QMessageBox.question(
-            self,
-            "Исправление реестра",
-            f"Удалить выбранные битые записи реестра ({len(selected)})?\n"
-            "Перед удалением автоматически сохранится .reg-файл резервной копии.",
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
 
         self.btn_reg_scan.setEnabled(False)
         self.btn_reg_fix.setEnabled(False)
         self.spinner.start()
+        self.reg_status_lbl.setText("⏳ Безопасное удаление старых записей и сохранение резервной копии…")
 
         self._reg_fix_worker = FixRegistryWorker(self._reg_issues, selected)
         self._reg_fix_worker.succeeded.connect(self._on_reg_fix_done)
-        self._reg_fix_worker.failed.connect(lambda msg: QMessageBox.critical(self, "Реестр", msg))
+        self._reg_fix_worker.failed.connect(lambda msg: QMessageBox.critical(self, "Исправление", msg))
         self._reg_fix_worker.finished.connect(self._on_reg_scan_finished)
         self._reg_fix_worker.start()
 
     def _on_reg_fix_done(self, summary: RegistryFixSummary) -> None:
-        msg = f"Исправлено записей: {summary.fixed_count}\nРезервная копия сохранена:\n{summary.backup_path}"
-        if summary.errors:
-            msg += "\n\nНе удалось удалить:\n" + "\n".join(summary.errors[:5])
-        QMessageBox.information(self, "Реестр очищен", msg)
+        self.reg_status_lbl.setText(
+            f"✔ Успешно исправлено записей: {summary.fixed_count} (резервная копия сохранена автоматически)"
+        )
+        self.reg_status_lbl.setStyleSheet(f"color: {SUCCESS}; font-size: 12px; font-weight: 600;")
         self.start_scan_registry()
 
     def refresh_startup_items(self) -> None:
@@ -1041,11 +1360,23 @@ class MainWindow(QMainWindow):
                 name_it.setCheckable(True)
                 name_it.setCheckState(Qt.CheckState.Checked if item.enabled else Qt.CheckState.Unchecked)
                 name_it.setData(idx, Qt.ItemDataRole.UserRole)
-                self.startup_model.appendRow([
-                    name_it,
-                    QStandardItem(item.source),
-                    QStandardItem(item.command),
-                ])
+
+                st_it = QStandardItem("Включён" if item.enabled else "Выключен")
+                st_it.setForeground(QColor(SUCCESS if item.enabled else TEXT_SECONDARY))
+
+                impact = estimate_startup_impact(item.name, item.command)
+                imp_it = QStandardItem(impact)
+                imp_color = DANGER if impact == "Высокая" else (WARNING if impact == "Средняя" else SUCCESS)
+                imp_it.setForeground(QColor(imp_color))
+
+                src_it = QStandardItem(item.source)
+                for cell in (name_it, st_it, imp_it, src_it):
+                    cell.setToolTip(f"Команда запуска: {item.command}")
+
+                self.startup_model.appendRow([name_it, st_it, imp_it, src_it])
+            self.startup_view.setColumnWidth(0, 175)
+            self.startup_view.setColumnWidth(1, 95)
+            self.startup_view.setColumnWidth(2, 130)
         finally:
             self._startup_loading = False
 
@@ -1060,13 +1391,21 @@ class MainWindow(QMainWindow):
         try:
             set_startup_item_enabled(st_item, new_enabled)
             st_item.enabled = new_enabled
-            state_txt = "включена" if new_enabled else "отключена"
-            self.status_title.setText(f"Автозагрузка «{st_item.name}» {state_txt}")
+            st_col = self.startup_model.item(item.row(), 1)
+            if st_col:
+                st_col.setText("Включён" if new_enabled else "Выключен")
+                st_col.setForeground(QColor(SUCCESS if new_enabled else TEXT_SECONDARY))
+            state_txt = "будет запускаться с Windows" if new_enabled else "больше не тормозит включение ПК"
+            self.status_title.setText(f"Программа «{st_item.name}» — {state_txt}")
         except OSError as exc:
             self._startup_loading = True
             item.setCheckState(Qt.CheckState.Checked if st_item.enabled else Qt.CheckState.Unchecked)
             self._startup_loading = False
-            QMessageBox.warning(self, "Автозагрузка", f"Не удалось изменить статус (нужны права администратора):\n{exc}")
+            QMessageBox.warning(
+                self,
+                "Автозапуск программ",
+                f"Чтобы изменить автозапуск системной программы «{st_item.name}», перезапустите OptiSys от имени администратора.\n\n({exc})",
+            )
 
     def start_optimize_task(self, task_key: str) -> None:
         if self._opt_worker and self._opt_worker.isRunning():
@@ -1074,8 +1413,20 @@ class MainWindow(QMainWindow):
         for b in self._opt_buttons:
             b.setEnabled(False)
         self.spinner.start()
-        self.opt_status_lbl.setText("Выполняется задача оптимизации…")
-        self.status_title.setText("Выполняется оптимизация системы…")
+        self.opt_progress.setRange(0, 0)
+        self.opt_progress.setFormat("Выполняется ускорение и настройка системы…")
+        self.opt_progress.show()
+        self.opt_status_lbl.setText("⏳ Пожалуйста, подождите — идёт настройка…")
+        self.status_title.setText("Выполняется оптимизация компьютера…")
+
+        if task_key == "all_fast":
+            for k in ("flush_dns", "arp_net_cache", "trim_ssd"):
+                if k in self._opt_card_status:
+                    self._opt_card_status[k].setText("⏳ Выполняется…")
+                    self._opt_card_status[k].setStyleSheet(f"color: {ACCENT}; font-size: 11px; font-weight: 600;")
+        elif task_key in self._opt_card_status:
+            self._opt_card_status[task_key].setText("⏳ Выполняется…")
+            self._opt_card_status[task_key].setStyleSheet(f"color: {ACCENT}; font-size: 11px; font-weight: 600;")
 
         self._opt_worker = OptimizeTaskWorker(task_key)
         self._opt_worker.succeeded.connect(self._on_optimize_done)
@@ -1089,11 +1440,25 @@ class MainWindow(QMainWindow):
         self._stop_spinner_if_idle()
 
     def _on_optimize_done(self, res: OptimizeResult) -> None:
+        self.opt_progress.hide()
         icon = "✔" if res.success else "⚠"
-        self.opt_status_lbl.setText(f"{icon} {res.title}: {res.message}")
-        self.status_title.setText(f"{res.title} — {'выполнено' if res.success else 'ошибка'}")
+        color = SUCCESS if res.success else WARNING
+        self.opt_status_lbl.setText(f"{icon} {res.message}")
+        self.opt_status_lbl.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
+        self.status_title.setText(f"{res.title}: {res.message}")
+
+        if res.key == "all_fast":
+            for k in ("flush_dns", "arp_net_cache", "trim_ssd"):
+                if k in self._opt_card_status:
+                    self._opt_card_status[k].setText("✔ Выполнено")
+                    self._opt_card_status[k].setStyleSheet(f"color: {SUCCESS}; font-size: 11px; font-weight: 600;")
+        elif res.key in self._opt_card_status:
+            lbl = self._opt_card_status[res.key]
+            lbl.setText("✔ Выполнено успешно" if res.success else "⚠ Нужны права администратора")
+            lbl.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: 600;")
 
     def _on_optimize_failed(self, message: str) -> None:
+        self.opt_progress.hide()
         self.opt_status_lbl.setText(f"Ошибка: {message}")
         QMessageBox.warning(self, "Оптимизация", message)
 
