@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 SEARCH_CRITERIA = "IsInstalled=0 and IsHidden=0 and Type='Driver'"
 CLIENT_ID = "optisys"
-SS_WINDOWS_UPDATE = 2  # ServerSelection: напрямую Windows Update (минуя WSUS)
+SS_WINDOWS_UPDATE = 0  # ServerSelection: ssDefault — источник по настройкам системы
 
 # OperationResultCode
 _RC_SUCCEEDED = 2

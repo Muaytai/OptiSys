@@ -674,6 +674,8 @@ class MainWindow(QMainWindow):
         self.reg_view.verticalHeader().setDefaultSectionSize(34)
         self.reg_view.horizontalHeader().setStretchLastSection(True)
         self.reg_view.horizontalHeader().setHighlightSections(False)
+        self.reg_view.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.reg_view.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         reg_layout.addWidget(self.reg_view, stretch=1)
 
         split.addWidget(reg_card, stretch=6)
@@ -1308,8 +1310,6 @@ class MainWindow(QMainWindow):
 
             self.reg_model.appendRow([cat_item, prog_item, reason_item])
 
-        self.reg_view.setColumnWidth(0, 210)
-        self.reg_view.setColumnWidth(1, 210)
         self.btn_reg_fix.setEnabled(bool(issues))
         if issues:
             self.reg_status_lbl.setText(
@@ -1454,7 +1454,8 @@ class MainWindow(QMainWindow):
                     self._opt_card_status[k].setStyleSheet(f"color: {SUCCESS}; font-size: 11px; font-weight: 600;")
         elif res.key in self._opt_card_status:
             lbl = self._opt_card_status[res.key]
-            lbl.setText("✔ Выполнено успешно" if res.success else "⚠ Нужны права администратора")
+            lbl.setText("✔ Выполнено успешно" if res.success else "⚠ Не удалось выполнить")
+            lbl.setToolTip(res.message)
             lbl.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: 600;")
 
     def _on_optimize_failed(self, message: str) -> None:

@@ -31,10 +31,21 @@ class WmiClient:
     def __init__(self) -> None:
         self._cimv2 = win32com.client.GetObject(r"winmgmts:\\.\root\cimv2")
         self._wmi: Any | None = None
+        self._storage: Any | None = None
 
     def query(self, wql: str, namespace: str = "cimv2") -> list[Any]:
-        service = self._cimv2 if namespace == "cimv2" else self._root_wmi()
+        if namespace == "cimv2":
+            service = self._cimv2
+        elif namespace == "storage":
+            service = self._storage_service()
+        else:
+            service = self._root_wmi()
         return list(service.ExecQuery(wql))
+
+    def _storage_service(self) -> Any:
+        if self._storage is None:
+            self._storage = win32com.client.GetObject(r"winmgmts:\\.\root\Microsoft\Windows\Storage")
+        return self._storage
 
     def _root_wmi(self) -> Any:
         if self._wmi is None:
@@ -54,7 +65,29 @@ def _kv(pairs: list[tuple[str, Any]]) -> list[list[str]]:
     return [[k, to_str(v)] for k, v in pairs if to_str(v)]
 
 
+_PLACEHOLDER_VALUES = {"invalid", "to be filled by o.e.m.", "default string", "system product name", "none", "n/a"}
+_BUS_TYPES = {7: "USB", 8: "RAID", 10: "SAS", 11: "SATA", 17: "NVMe"}
+_MEDIA_TYPES = {3: "HDD", 4: "SSD"}
+_WMI_SPEED_UNKNOWN = 2**62  # Windows отдаёт ~2^63-1 для неактивных адаптеров
+
+
+def _clean(value: Any) -> str:
+    """Пустая строка вместо OEM-заглушек вида 'INVALID' / 'To be filled by O.E.M.'."""
+    text = to_str(value)
+    return "" if text.lower() in _PLACEHOLDER_VALUES else text
+
+
 # ---------- Разделы ----------
+
+def _product_name(wmi: WmiClient) -> str:
+    """Запасное имя модели из Win32_ComputerSystemProduct (Version / Name)."""
+    for p in wmi.query("SELECT * FROM Win32_ComputerSystemProduct"):
+        for field in ("Version", "Name"):
+            value = _clean(prop(p, field))
+            if value:
+                return value
+    return ""
+
 
 def _overview(wmi: WmiClient) -> Section:
     rows: list[list[str]] = []
@@ -71,13 +104,13 @@ def _overview(wmi: WmiClient) -> Section:
         rows += _kv([
             ("Имя компьютера", prop(cs, "Name")),
             ("Производитель", prop(cs, "Manufacturer")),
-            ("Модель", prop(cs, "Model")),
+            ("Модель", _clean(prop(cs, "Model")) or _product_name(wmi)),
             ("ОЗУ всего", fmt_bytes(prop(cs, "TotalPhysicalMemory"))),
         ])
     for bb in wmi.query("SELECT * FROM Win32_BaseBoard"):
-        rows += _kv([
-            ("Материнская плата", f"{to_str(prop(bb, 'Manufacturer'))} {to_str(prop(bb, 'Product'))}"),
-        ])
+        product = _clean(prop(bb, "Product"))
+        if product:
+            rows += _kv([("Материнская плата", f"{to_str(prop(bb, 'Manufacturer'))} {product}")])
     for bios in wmi.query("SELECT * FROM Win32_BIOS"):
         rows += _kv([
             ("BIOS", f"{to_str(prop(bios, 'Manufacturer'))} {to_str(prop(bios, 'SMBIOSBIOSVersion'))}"),
@@ -94,7 +127,7 @@ def _cpu(wmi: WmiClient) -> Section:
             ("Производитель", prop(cpu, "Manufacturer")),
             ("Ядра", prop(cpu, "NumberOfCores")),
             ("Потоки", prop(cpu, "NumberOfLogicalProcessors")),
-            ("Макс. частота, МГц", prop(cpu, "MaxClockSpeed")),
+            ("Базовая частота, МГц", prop(cpu, "MaxClockSpeed")),
             ("Кэш L2", fmt_bytes((prop(cpu, "L2CacheSize") or 0) * 1024)),
             ("Кэш L3", fmt_bytes((prop(cpu, "L3CacheSize") or 0) * 1024)),
             ("Сокет", prop(cpu, "SocketDesignation")),
@@ -106,7 +139,7 @@ def _memory(wmi: WmiClient) -> Section:
     cols = ["Слот", "Объём", "Частота, МГц", "Производитель", "Партномер"]
     rows = [
         [
-            to_str(prop(m, "DeviceLocator")),
+            " ".join(x for x in (to_str(prop(m, "BankLabel")), to_str(prop(m, "DeviceLocator"))) if x),
             fmt_bytes(prop(m, "Capacity")),
             to_str(prop(m, "ConfiguredClockSpeed") or prop(m, "Speed")),
             to_str(prop(m, "Manufacturer")),
@@ -117,14 +150,31 @@ def _memory(wmi: WmiClient) -> Section:
     return Section("memory", "Память", cols, rows)
 
 
+def _physical_disk_info(wmi: WmiClient) -> dict[str, tuple[str, str]]:
+    """DeviceId -> (тип шины, тип носителя) из Storage Management; пусто, если недоступно."""
+    info: dict[str, tuple[str, str]] = {}
+    try:
+        for pd in wmi.query("SELECT DeviceId, BusType, MediaType FROM MSFT_PhysicalDisk", namespace="storage"):
+            info[to_str(prop(pd, "DeviceId"))] = (
+                _BUS_TYPES.get(int(prop(pd, "BusType") or 0), ""),
+                _MEDIA_TYPES.get(int(prop(pd, "MediaType") or 0), ""),
+            )
+    except pywintypes.com_error:
+        logger.warning("Storage Management WMI недоступен, тип шины берём из Win32_DiskDrive")
+    return info
+
+
 def _disks(wmi: WmiClient) -> Section:
     cols = ["Устройство", "Модель / ФС", "Интерфейс", "Размер", "Свободно"]
     rows: list[list[str]] = []
+    phys = _physical_disk_info(wmi)
     for d in wmi.query("SELECT * FROM Win32_DiskDrive"):
+        bus, media = phys.get(to_str(prop(d, "Index")), ("", ""))
+        interface = " ".join(x for x in (bus, media) if x) or to_str(prop(d, "InterfaceType"))
         rows.append([
             to_str(prop(d, "DeviceID")),
             to_str(prop(d, "Model")),
-            to_str(prop(d, "InterfaceType")),
+            interface,
             fmt_bytes(prop(d, "Size")),
             "",
         ])
@@ -202,9 +252,10 @@ def _monitors(wmi: WmiClient) -> Section:
     try:
         for m in wmi.query("SELECT * FROM WmiMonitorID", namespace="wmi"):
             rows.append([
-                _decode_wmi_string(prop(m, "UserFriendlyName")),
+                _decode_wmi_string(prop(m, "UserFriendlyName"))
+                or f"Встроенный / безымянный экран ({_decode_wmi_string(prop(m, 'ManufacturerName')) or '?'})",
                 _decode_wmi_string(prop(m, "ManufacturerName")),
-                _decode_wmi_string(prop(m, "SerialNumberID")),
+                _decode_wmi_string(prop(m, "SerialNumberID")).strip("0") and _decode_wmi_string(prop(m, "SerialNumberID")),
                 to_str(prop(m, "YearOfManufacture")),
             ])
     except pywintypes.com_error:
@@ -227,7 +278,7 @@ def _network(wmi: WmiClient) -> Section:
         rows.append([
             to_str(prop(a, "Name")),
             to_str(prop(a, "MACAddress")),
-            f"{int(speed) // 1_000_000} Мбит/с" if speed else "",
+            f"{int(speed) // 1_000_000} Мбит/с" if speed and int(speed) < _WMI_SPEED_UNKNOWN else "",
             to_str(prop(cfg, "IPAddress")) if cfg is not None else "",
             "Подключён" if prop(a, "NetConnectionStatus") == 2 else "Не подключён",
         ])

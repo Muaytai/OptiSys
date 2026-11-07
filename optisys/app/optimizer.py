@@ -182,28 +182,29 @@ def run_optimization_task(key: str) -> OptimizeResult:
         )
         return OptimizeResult(key, "Сброс сетевых задержек и маршрутов", ok, msg)
     if key == "trim_ssd":
-        ok, _ = _run_cmd(["defrag", sys_drive, "/O"], timeout=300)
+        # /L — быстрый retrim (секунды); /O на NVMe может висеть минутами
+        ok, detail = _run_cmd(["defrag", sys_drive, "/L"], timeout=120)
         msg = (
             f"Системный диск {sys_drive} успешно оптимизирован"
             if ok
-            else "Для оптимизации системного диска требуются права администратора"
+            else f"Не удалось оптимизировать диск {sys_drive}: {detail}"
         )
         return OptimizeResult(key, f"Ускорение работы системного диска ({sys_drive})", ok, msg)
     if key == "winsxs_clean":
-        ok, _ = _run_cmd(
+        ok, detail = _run_cmd(
             ["Dism.exe", "/Online", "/Cleanup-Image", "/StartComponentCleanup"],
-            timeout=600,
+            timeout=900,
         )
         msg = (
             "Устаревшие копии обновлений Windows удалены"
             if ok
-            else "Для очистки системного хранилища обновлений нужны права администратора"
+            else f"Не удалось очистить хранилище обновлений: {detail}"
         )
         return OptimizeResult(key, "Очистка старых копий обновлений Windows", ok, msg)
     if key == "all_fast":
         ok_dns, _ = _run_cmd(["ipconfig", "/flushdns"], timeout=30)
         ok_arp, _ = _run_cmd(["netsh", "interface", "ip", "delete", "arpcache"], timeout=30)
-        ok_ssd, _ = _run_cmd(["defrag", sys_drive, "/O"], timeout=300)
+        ok_ssd, _ = _run_cmd(["defrag", sys_drive, "/L"], timeout=120)
         done_parts = ["интернет"]
         if ok_arp:
             done_parts.append("сеть")
@@ -214,7 +215,7 @@ def run_optimization_task(key: str) -> OptimizeResult:
             "Комплексное ускорение ПК в 1 клик",
             ok_dns,
             f"Оптимизировано: {', '.join(done_parts)}"
-            + ("" if ok_ssd else " (для ускорения диска нужны права администратора)"),
+            + ("" if ok_ssd else " (диск не удалось оптимизировать)"),
         )
     return OptimizeResult(key, key, False, "Неизвестная задача")
 
