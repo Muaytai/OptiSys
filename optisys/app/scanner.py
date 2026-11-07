@@ -89,6 +89,46 @@ def _product_name(wmi: WmiClient) -> str:
     return ""
 
 
+def _battery_rows(wmi: WmiClient) -> list[tuple[str, str]]:
+    """Информация о заряде и износе батареи ноутбука (пусто на стационарном ПК)."""
+    pairs: list[tuple[str, str]] = []
+    try:
+        batteries = wmi.query("SELECT Name, EstimatedChargeRemaining, BatteryStatus FROM Win32_Battery")
+    except pywintypes.com_error:
+        return pairs
+    if not batteries:
+        return pairs
+
+    b0 = batteries[0]
+    charge = prop(b0, "EstimatedChargeRemaining")
+    status_code = int(prop(b0, "BatteryStatus") or 0)
+    status_txt = "От сети / Заряжается" if status_code in (2, 6, 7, 8, 9) else "От аккумулятора"
+    if charge is not None:
+        pairs.append(("Заряд батареи", f"{charge}% ({status_txt})"))
+
+    try:
+        designed = [
+            int(prop(x, "DesignedCapacity") or 0)
+            for x in wmi.query("SELECT DesignedCapacity FROM BatteryStaticData", namespace="wmi")
+        ]
+        full = [
+            int(prop(x, "FullChargedCapacity") or 0)
+            for x in wmi.query("SELECT FullChargedCapacity FROM BatteryFullChargedCapacity", namespace="wmi")
+        ]
+        if designed and full and designed[0] > 0 and full[0] > 0:
+            d_wh = designed[0] / 1000.0
+            f_wh = full[0] / 1000.0
+            health_pct = min(100.0, f_wh / d_wh * 100.0)
+            wear_pct = max(0.0, 100.0 - health_pct)
+            pairs.append((
+                "Здоровье батареи",
+                f"{health_pct:.1f}% (износ {wear_pct:.1f}% · ёмкость {f_wh:.1f} из {d_wh:.1f} Вт·ч)",
+            ))
+    except pywintypes.com_error:
+        pass
+    return pairs
+
+
 def _overview(wmi: WmiClient) -> Section:
     rows: list[list[str]] = []
     for os_ in wmi.query("SELECT * FROM Win32_OperatingSystem"):
@@ -101,10 +141,11 @@ def _overview(wmi: WmiClient) -> Section:
             ("Последняя загрузка", fmt_cim_date(prop(os_, "LastBootUpTime"), with_time=True)),
         ])
     for cs in wmi.query("SELECT * FROM Win32_ComputerSystem"):
+        model = _clean(prop(cs, "Model")) or _product_name(wmi) or _clean(prop(cs, "SystemFamily"))
         rows += _kv([
             ("Имя компьютера", prop(cs, "Name")),
             ("Производитель", prop(cs, "Manufacturer")),
-            ("Модель", _clean(prop(cs, "Model")) or _product_name(wmi)),
+            ("Модель", model),
             ("ОЗУ всего", fmt_bytes(prop(cs, "TotalPhysicalMemory"))),
         ])
     for bb in wmi.query("SELECT * FROM Win32_BaseBoard"):
@@ -116,6 +157,7 @@ def _overview(wmi: WmiClient) -> Section:
             ("BIOS", f"{to_str(prop(bios, 'Manufacturer'))} {to_str(prop(bios, 'SMBIOSBIOSVersion'))}"),
             ("Дата BIOS", fmt_cim_date(prop(bios, "ReleaseDate"))),
         ])
+    rows += _kv(_battery_rows(wmi))
     return Section("overview", "Обзор", KV_COLUMNS, rows)
 
 
@@ -150,41 +192,75 @@ def _memory(wmi: WmiClient) -> Section:
     return Section("memory", "Память", cols, rows)
 
 
-def _physical_disk_info(wmi: WmiClient) -> dict[str, tuple[str, str]]:
-    """DeviceId -> (тип шины, тип носителя) из Storage Management; пусто, если недоступно."""
-    info: dict[str, tuple[str, str]] = {}
+_HEALTH_STATUS = {0: "Исправен (S.M.A.R.T. OK)", 1: "Внимание (Warning)", 2: "Сбой (Unhealthy)"}
+
+
+def _physical_disk_info(wmi: WmiClient) -> dict[str, tuple[str, str, str, str]]:
+    """DeviceId -> (чистое имя, шина, носитель, здоровье S.M.A.R.T.) из Storage Management."""
+    info: dict[str, tuple[str, str, str, str]] = {}
     try:
-        for pd in wmi.query("SELECT DeviceId, BusType, MediaType FROM MSFT_PhysicalDisk", namespace="storage"):
-            info[to_str(prop(pd, "DeviceId"))] = (
-                _BUS_TYPES.get(int(prop(pd, "BusType") or 0), ""),
-                _MEDIA_TYPES.get(int(prop(pd, "MediaType") or 0), ""),
-            )
+        for pd in wmi.query("SELECT * FROM MSFT_PhysicalDisk", namespace="storage"):
+            dev_id = to_str(prop(pd, "DeviceId"))
+            friendly = to_str(prop(pd, "FriendlyName"))
+            bus_code = int(prop(pd, "BusType") or 0)
+            media_code = int(prop(pd, "MediaType") or 0)
+            spindle = prop(pd, "SpindleSpeed")
+            bus = _BUS_TYPES.get(bus_code, "")
+            media = _MEDIA_TYPES.get(media_code, "")
+            if not media and (bus_code == 17 or spindle == 0):
+                media = "SSD"
+
+            health_code = int(prop(pd, "HealthStatus") or 0)
+            health_parts = [_HEALTH_STATUS.get(health_code, "Исправен")]
+            try:
+                for rc in pd.Associators_(None, "MSFT_StorageReliabilityCounter"):
+                    temp = int(prop(rc, "Temperature") or 0)
+                    wear = int(prop(rc, "Wear") or 0)
+                    hours = int(prop(rc, "PowerOnHours") or 0)
+                    if 0 < temp < 120:
+                        health_parts.append(f"{temp} °C")
+                    if 0 < wear <= 100:
+                        health_parts.append(f"износ {wear}%")
+                    if hours > 0:
+                        health_parts.append(f"{hours} ч")
+            except Exception:  # noqa: BLE001
+                pass
+
+            info[dev_id] = (friendly, bus, media, " · ".join(health_parts))
     except pywintypes.com_error:
         logger.warning("Storage Management WMI недоступен, тип шины берём из Win32_DiskDrive")
     return info
 
 
 def _disks(wmi: WmiClient) -> Section:
-    cols = ["Устройство", "Модель / ФС", "Интерфейс", "Размер", "Свободно"]
+    cols = ["Устройство", "Модель / ФС", "Интерфейс", "Размер", "Свободно", "Здоровье / Статус"]
     rows: list[list[str]] = []
     phys = _physical_disk_info(wmi)
     for d in wmi.query("SELECT * FROM Win32_DiskDrive"):
-        bus, media = phys.get(to_str(prop(d, "Index")), ("", ""))
+        friendly, bus, media, health = phys.get(to_str(prop(d, "Index")), ("", "", "", ""))
+        raw_model = to_str(prop(d, "Model")).replace(" SCSI Disk Device", "").strip()
+        model = friendly or raw_model
         interface = " ".join(x for x in (bus, media) if x) or to_str(prop(d, "InterfaceType"))
+        status_fallback = "Исправен (OK)" if to_str(prop(d, "Status")).upper() == "OK" else to_str(prop(d, "Status"))
         rows.append([
             to_str(prop(d, "DeviceID")),
-            to_str(prop(d, "Model")),
+            model,
             interface,
             fmt_bytes(prop(d, "Size")),
             "",
+            health or status_fallback,
         ])
     for ld in wmi.query("SELECT * FROM Win32_LogicalDisk WHERE DriveType=3"):
+        size_b = float(prop(ld, "Size") or 0)
+        free_b = float(prop(ld, "FreeSpace") or 0)
+        used_pct = f"Занято {(size_b - free_b) / size_b * 100:.0f}%" if size_b > 0 else "Активен"
         rows.append([
             to_str(prop(ld, "DeviceID")),
             to_str(prop(ld, "FileSystem")),
             "Логический",
-            fmt_bytes(prop(ld, "Size")),
-            fmt_bytes(prop(ld, "FreeSpace")),
+            fmt_bytes(size_b),
+            fmt_bytes(free_b),
+            used_pct,
         ])
     return Section("disks", "Диски", cols, rows)
 

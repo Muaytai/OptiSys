@@ -7,6 +7,7 @@ COM-объекты WUA нельзя передавать между потока
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -41,11 +42,33 @@ def _session() -> Any:
     return session
 
 
-def _search_raw(session: Any) -> list[Any]:
+def _search_raw(
+    session: Any,
+    is_cancelled: Callable[[], bool] | None = None,
+    on_status: Callable[[str], None] | None = None,
+    timeout_sec: int = 180,
+) -> list[Any]:
     searcher = session.CreateUpdateSearcher()
     searcher.ServerSelection = SS_WINDOWS_UPDATE
     try:
-        result = searcher.Search(SEARCH_CRITERIA)
+        job = searcher.BeginSearch(SEARCH_CRITERIA, session, None)
+        t0 = time.monotonic()
+        last_sec = -1
+        while not job.IsCompleted:
+            if is_cancelled and is_cancelled():
+                job.RequestAbort()
+                job.CleanUp()
+                return []
+            elapsed = int(time.monotonic() - t0)
+            if elapsed >= timeout_sec:
+                job.RequestAbort()
+                job.CleanUp()
+                raise WindowsUpdateError(f"Превышено время ожидания ответа Windows Update ({timeout_sec} с)")
+            if on_status and elapsed != last_sec:
+                last_sec = elapsed
+                on_status(f"Поиск обновлений в каталоге Windows Update… ({elapsed} с)")
+            time.sleep(0.35)
+        result = searcher.EndSearch(job)
     except pywintypes.com_error as exc:
         raise WindowsUpdateError(f"Поиск обновлений не удался: {_com_message(exc)}") from exc
     return [result.Updates.Item(i) for i in range(result.Updates.Count)]
@@ -76,9 +99,12 @@ def _to_model(update: Any) -> DriverUpdate:
     )
 
 
-def search_driver_updates() -> list[DriverUpdate]:
+def search_driver_updates(
+    is_cancelled: Callable[[], bool] | None = None,
+    on_status: Callable[[str], None] | None = None,
+) -> list[DriverUpdate]:
     """Список доступных (не установленных) обновлений драйверов."""
-    return [_to_model(u) for u in _search_raw(_session())]
+    return [_to_model(u) for u in _search_raw(_session(), is_cancelled=is_cancelled, on_status=on_status)]
 
 
 def install_driver_updates(

@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .theme import ACCENT, BORDER, DANGER, TEXT_PRIMARY, TEXT_SECONDARY, WARNING
+from .theme import ACCENT, BORDER, DANGER, SUCCESS, TEXT_PRIMARY, TEXT_SECONDARY, WARNING
 
 
 def draw_icon(painter: QPainter, key: str, rect: QRectF, color: QColor) -> None:
@@ -176,13 +176,17 @@ class SpinnerWidget(QWidget):
 class AnimatedRingGauge(QWidget):
     """Кольцевой график (Donut Gauge) с плавной анимацией заполнения."""
 
-    def __init__(self, title: str, subtitle: str = "", accent_color: str = ACCENT) -> None:
+    def __init__(
+        self, title: str, subtitle: str = "", accent_color: str = ACCENT, higher_is_better: bool = False
+    ) -> None:
         super().__init__()
-        self.setMinimumSize(155, 165)
+        self.setMinimumSize(130, 165)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._title = title
         self._subtitle = subtitle
+        self._base_accent = QColor(accent_color)
         self._accent = QColor(accent_color)
+        self._higher_is_better = higher_is_better
         self._current = 0.0
 
         self._anim = QVariantAnimation(self)
@@ -196,12 +200,14 @@ class AnimatedRingGauge(QWidget):
         if subtitle is not None:
             self._subtitle = subtitle
         clamped = max(0.0, min(100.0, percent))
-        if clamped >= 88:
+        if self._higher_is_better:
+            self._accent = QColor(SUCCESS if clamped >= 90 else (WARNING if clamped >= 70 else DANGER))
+        elif clamped >= 88:
             self._accent = QColor(DANGER)
         elif clamped >= 72:
             self._accent = QColor(WARNING)
         else:
-            self._accent = QColor(ACCENT)
+            self._accent = QColor(self._base_accent)
         self._anim.stop()
         self._anim.setStartValue(self._current)
         self._anim.setEndValue(clamped)
@@ -348,7 +354,8 @@ class SidebarButton(QPushButton):
         painter.setPen(text_color)
         font = QFont("Segoe UI", 10, QFont.Weight.DemiBold if self._active else QFont.Weight.Normal)
         painter.setFont(font)
-        text_rect = QRectF(42, 0, self.width() - 88, self.height())
+        right_pad = 84 if self._badge else 48
+        text_rect = QRectF(42, 0, self.width() - right_pad, self.height())
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
 
         if self._badge:

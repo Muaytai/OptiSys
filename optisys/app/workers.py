@@ -7,7 +7,7 @@ import pythoncom
 import pywintypes
 from PySide6.QtCore import QThread, Signal
 
-from .cleaner import analyze_junk, clean_junk
+from .cleaner import analyze_junk, clean_junk, scan_large_files
 from .drivers import WindowsUpdateError, install_driver_updates, search_driver_updates
 from .models import RegistryIssue
 from .optimizer import run_optimization_task
@@ -34,13 +34,29 @@ class ScanWorker(QThread):
 
 
 class SearchUpdatesWorker(QThread):
+    status = Signal(str)
     succeeded = Signal(list)  # list[DriverUpdate]
+    cancelled = Signal()
     failed = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
 
     def run(self) -> None:
         pythoncom.CoInitialize()
         try:
-            self.succeeded.emit(search_driver_updates())
+            items = search_driver_updates(
+                is_cancelled=lambda: self._cancel_requested,
+                on_status=self.status.emit,
+            )
+            if self._cancel_requested:
+                self.cancelled.emit()
+            else:
+                self.succeeded.emit(items)
         except (WindowsUpdateError, pywintypes.com_error) as exc:
             logger.exception("Поиск обновлений не удался")
             self.failed.emit(str(exc))
@@ -145,3 +161,20 @@ class OptimizeTaskWorker(QThread):
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка задачи оптимизации")
             self.failed.emit(str(exc))
+
+
+class ScanLargeFilesWorker(QThread):
+    succeeded = Signal(list)  # list[LargeFileItem]
+    failed = Signal(str)
+
+    def __init__(self, min_size_mb: int = 100) -> None:
+        super().__init__()
+        self._min_size_mb = min_size_mb
+
+    def run(self) -> None:
+        try:
+            self.succeeded.emit(scan_large_files(self._min_size_mb))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ошибка поиска крупных файлов")
+            self.failed.emit(str(exc))
+

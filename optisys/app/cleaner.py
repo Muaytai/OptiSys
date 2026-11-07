@@ -5,13 +5,14 @@ import ctypes
 from ctypes import wintypes
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable
 
-from .models import CleanCategoryResult, CleanSummary, CleanTarget
+from .models import CleanCategoryResult, CleanSummary, CleanTarget, LargeFileItem
 from .utils import fmt_bytes
 
 logger = logging.getLogger(__name__)
@@ -556,3 +557,143 @@ def clean_junk(
         progress(total, total, "", "Очистка завершена")
 
     return summary
+
+
+def _classify_large_file(fpath: Path) -> tuple[str, str, str]:
+    """Определяет безопасность удаления файла: (уровень, статус, понятное описание)."""
+    full_low = str(fpath).lower()
+    name_low = fpath.name.lower()
+    ext = fpath.suffix.lower()
+
+    # 1. Виртуальные диски WSL / Docker / VM — удалять опасно для данных пользователя
+    if ext in (".vhdx", ".vhd", ".vmdk", ".vdi"):
+        return (
+            "danger",
+            "🔴 Не трогать (Диск WSL/Docker)",
+            "Виртуальный диск Linux (WSL) или Docker. Удаление сотрёт все контейнеры и данные внутри виртуальной среды!",
+        )
+
+    # 2. Кэши шейдеров GPU и ИИ-моделей браузеров — 100% безопасно удалять
+    if (
+        any(k in full_low for k in ("\\dxcache\\", "\\glcache\\", "\\nv_cache\\", "\\computecache\\", "\\shadercache\\"))
+        or ext == ".nvph"
+    ):
+        return (
+            "safe",
+            "🟢 Безопасно удалить (Высокий приоритет)",
+            "Кэш шейдеров видеокарты. Можно смело удалять — освободит гигабайты места без вреда для системы и игр.",
+        )
+
+    if "optguideondevicemodel" in full_low or any(
+        k in full_low for k in ("\\cache\\", "\\code cache\\", "\\gpucache\\", "\\dawncache\\", "\\pip\\cache\\", "\\npm-cache\\")
+    ):
+        return (
+            "safe",
+            "🟢 Безопасно удалить (Кэш)",
+            "Временный кэш браузера или пакетов. Безопасно для системы — при необходимости скачается заново.",
+        )
+
+    # 3. Временные файлы и дампы ошибок в Temp / CrashDumps
+    if "\\temp\\" in full_low or "\\crashdumps\\" in full_low or "\\logs\\" in full_low or ext in (".dmp", ".tmp", ".log", ".old"):
+        return (
+            "safe",
+            "🟢 Безопасно удалить (Временный файл)",
+            "Отработанный временный файл, лог или отчёт о сбое в папке Temp. Больше не нужен системе.",
+        )
+
+    # 4. Установщики и архивы в папке «Загрузки» (Downloads)
+    if "\\downloads\\" in full_low and ext in (".exe", ".msi", ".iso", ".zip", ".rar", ".7z", ".msix"):
+        return (
+            "safe",
+            "🟢 Можно удалить (Скачанный установщик)",
+            "Скачанный установщик или архив в «Загрузках». Если программа уже установлена — смело удаляйте.",
+        )
+
+    # 5. Моды игр (например, .pak в AppData\Local\...\Mods)
+    if "\\mods\\" in full_low or ext == ".pak":
+        return (
+            "review",
+            "🟡 Проверить (Мод или архив игры)",
+            "Файл модификации или ресурсов игры. На работу Windows не влияет — удаляйте, если больше не играете в эту игру.",
+        )
+
+    # 6. Рабочие файлы установленных программ в AppData (.dll, .exe, .asar, .bin)
+    if "\\appdata\\" in full_low and ext in (".dll", ".exe", ".asar", ".dat", ".bin", ".pak"):
+        return (
+            "danger",
+            "🔴 Не удалять (Файл программы)",
+            "Рабочий модуль установленной программы или браузера. Его удаление сломает запуск этой программы!",
+        )
+
+    # 7. Личные видео, архивы и документы пользователя
+    return (
+        "review",
+        "🟡 На ваше усмотрение (Личный файл)",
+        "Ваш личный файл (видео, архив или документ). На работу Windows не влияет — удаляйте, только если файл вам не нужен.",
+    )
+
+
+def scan_large_files(min_size_mb: int = 100, limit: int = 60) -> list[LargeFileItem]:
+    """Ищет самые крупные файлы в пользовательских папках (Downloads, Desktop, Videos, AppData)."""
+    min_bytes = min_size_mb * 1024 * 1024
+    home = Path.home()
+    roots = [
+        home / "Downloads",
+        home / "Desktop",
+        home / "Videos",
+        home / "Documents",
+        Path(os.environ.get("LOCALAPPDATA", "")),
+    ]
+    found: list[LargeFileItem] = []
+    seen_paths: set[str] = set()
+
+    def _walk(directory: Path, depth: int) -> None:
+        if depth > 5:
+            return
+        try:
+            with os.scandir(directory) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            low_name = entry.name.lower()
+                            if low_name in ("windowsapps", "microsoft", "programs"):
+                                continue
+                            _walk(Path(entry.path), depth + 1)
+                        elif entry.is_file(follow_symlinks=False):
+                            st = entry.stat(follow_symlinks=False)
+                            if st.st_size >= min_bytes:
+                                norm = os.path.normcase(entry.path)
+                                if norm in seen_paths:
+                                    continue
+                                seen_paths.add(norm)
+                                fpath = Path(entry.path)
+                                level, badge, desc = _classify_large_file(fpath)
+                                dt = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+                                found.append(
+                                    LargeFileItem(
+                                        path=entry.path,
+                                        name=entry.name,
+                                        folder=str(fpath.parent),
+                                        size_bytes=st.st_size,
+                                        modified_str=dt,
+                                        safety_level=level,
+                                        safety_badge=badge,
+                                        description=desc,
+                                    )
+                                )
+                    except OSError:
+                        continue
+        except OSError:
+            return
+
+    for root in roots:
+        if root and root.is_dir():
+            _walk(root, 0)
+
+    # Сначала безопасные к удалению, затем личные, затем системные/программные; внутри группы — по убыванию размера
+    order = {"safe": 0, "review": 1, "danger": 2}
+    found.sort(key=lambda item: (order.get(item.safety_level, 1), -item.size_bytes))
+    return found[:limit]
+

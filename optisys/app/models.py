@@ -149,3 +149,29 @@ class OptimizeResult:
     title: str
     success: bool
     message: str
+
+
+@dataclass(slots=True)
+class LargeFileItem:
+    """Крупный файл, найденный при сканировании пользовательских папок."""
+
+    path: str
+    name: str
+    folder: str
+    size_bytes: int
+    modified_str: str
+    safety_level: str = "review"
+    safety_badge: str = ""
+    description: str = ""
+
+
+@dataclass(slots=True)
+class SystemTweak:
+    """Переключатель системной настройки Windows."""
+
+    key: str
+    title: str
+    description: str
+    enabled: bool
+    requires_admin: bool = False
+

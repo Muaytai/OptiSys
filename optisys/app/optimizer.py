@@ -1,13 +1,16 @@
 """Управление автозагрузкой Windows (через StartupApproved) и задачи оптимизации системы."""
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 import logging
 import os
 from pathlib import Path
 import subprocess
 import winreg
 
-from .models import OptimizeResult, StartupItem
+from .models import OptimizeResult, StartupItem, SystemTweak
+from .utils import fmt_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -181,11 +184,21 @@ def run_optimization_task(key: str) -> OptimizeResult:
             else "Для полного сброса сетевых маршрутов запустите программу от имени администратора"
         )
         return OptimizeResult(key, "Сброс сетевых задержек и маршрутов", ok, msg)
+    if key == "free_ram":
+        trimmed, freed_bytes = free_memory_working_sets()
+        freed_str = fmt_bytes(freed_bytes) if freed_bytes > 1024 * 1024 else "кэш уже оптимален"
+        return OptimizeResult(
+            key,
+            "Освобождение оперативной памяти (RAM)",
+            trimmed > 0,
+            f"Освобождено ОЗУ: {freed_str} (оптимизировано процессов: {trimmed})",
+        )
     if key == "trim_ssd":
-        # /L — быстрый retrim (секунды); /O на NVMe может висеть минутами
+        # Включаем аппаратный TRIM в NTFS и запускаем быстрый retrim (/L)
+        _run_cmd(["fsutil", "behavior", "set", "DisableDeleteNotify", "0"], timeout=15)
         ok, detail = _run_cmd(["defrag", sys_drive, "/L"], timeout=120)
         msg = (
-            f"Системный диск {sys_drive} успешно оптимизирован"
+            f"Системный диск {sys_drive} оптимизирован (TRIM активен)"
             if ok
             else f"Не удалось оптимизировать диск {sys_drive}: {detail}"
         )
@@ -204,12 +217,16 @@ def run_optimization_task(key: str) -> OptimizeResult:
     if key == "all_fast":
         ok_dns, _ = _run_cmd(["ipconfig", "/flushdns"], timeout=30)
         ok_arp, _ = _run_cmd(["netsh", "interface", "ip", "delete", "arpcache"], timeout=30)
+        _run_cmd(["fsutil", "behavior", "set", "DisableDeleteNotify", "0"], timeout=15)
         ok_ssd, _ = _run_cmd(["defrag", sys_drive, "/L"], timeout=120)
+        _, freed_ram = free_memory_working_sets()
         done_parts = ["интернет"]
         if ok_arp:
             done_parts.append("сеть")
         if ok_ssd:
             done_parts.append(f"диск {sys_drive}")
+        if freed_ram > 1024 * 1024:
+            done_parts.append(f"ОЗУ (+{fmt_bytes(freed_ram)})")
         return OptimizeResult(
             key,
             "Комплексное ускорение ПК в 1 клик",
@@ -218,4 +235,186 @@ def run_optimization_task(key: str) -> OptimizeResult:
             + ("" if ok_ssd else " (диск не удалось оптимизировать)"),
         )
     return OptimizeResult(key, key, False, "Неизвестная задача")
+
+
+# ---------- Оперативная память (WinAPI) ----------
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", wintypes.DWORD),
+        ("dwMemoryLoad", wintypes.DWORD),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def get_memory_usage() -> tuple[float, float, float]:
+    """Возвращает (процент_загрузки, занято_ГБ, всего_ГБ) через GlobalMemoryStatusEx."""
+    stat = _MEMORYSTATUSEX()
+    stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+        return 0.0, 0.0, 0.0
+    total_gb = stat.ullTotalPhys / 1024**3
+    avail_gb = stat.ullAvailPhys / 1024**3
+    used_gb = max(0.0, total_gb - avail_gb)
+    return float(stat.dwMemoryLoad), used_gb, total_gb
+
+
+def free_memory_working_sets() -> tuple[int, int]:
+    """Сбрасывает неиспользуемые рабочие наборы фоновых процессов (EmptyWorkingSet).
+
+    Возвращает (число_процессов, освобождено_байт).
+    """
+    stat_before = _MEMORYSTATUSEX()
+    stat_before.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat_before))
+
+    arr = (wintypes.DWORD * 4096)()
+    cb_needed = wintypes.DWORD()
+    if not ctypes.windll.psapi.EnumProcesses(ctypes.byref(arr), ctypes.sizeof(arr), ctypes.byref(cb_needed)):
+        return 0, 0
+
+    count = cb_needed.value // ctypes.sizeof(wintypes.DWORD)
+    current_pid = os.getpid()
+    access = 0x0400 | 0x0100  # PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA
+    trimmed = 0
+    for i in range(count):
+        pid = int(arr[i])
+        if pid <= 4 or pid == current_pid:
+            continue
+        handle = ctypes.windll.kernel32.OpenProcess(access, False, pid)
+        if handle:
+            try:
+                if ctypes.windll.psapi.EmptyWorkingSet(handle):
+                    trimmed += 1
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+
+    stat_after = _MEMORYSTATUSEX()
+    stat_after.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat_after))
+    freed = max(0, int(stat_after.ullAvailPhys) - int(stat_before.ullAvailPhys))
+    return trimmed, freed
+
+
+# ---------- Безопасные переключатели настроек Windows 11 ----------
+
+_GUID_HIGH_PERF = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+_GUID_ULTIMATE_PERF = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+_GUID_BALANCED = "381b4222-f694-41f0-9685-ff5bb260df2e"
+
+
+def _reg_get_dword(hive: int, subkey: str, name: str, default: int = 0) -> int:
+    try:
+        with winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, name)
+            return int(val)
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def _reg_set_dword(hive: int, subkey: str, name: str, value: int) -> None:
+    with winreg.CreateKeyEx(hive, subkey, 0, winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(value))
+
+
+def _is_high_perf_power() -> bool:
+    ok, out = _run_cmd(["powercfg", "/getactivescheme"], timeout=10)
+    if not ok:
+        return False
+    low = out.lower()
+    return _GUID_HIGH_PERF in low or _GUID_ULTIMATE_PERF in low
+
+
+def list_system_tweaks() -> list[SystemTweak]:
+    """Возвращает список безопасных настроек Windows с их текущим состоянием."""
+    bing_off = _reg_get_dword(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Policies\Microsoft\Windows\Explorer",
+        "DisableSearchBoxSuggestions",
+        0,
+    ) == 1
+    tips_off = _reg_get_dword(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager",
+        "SubscribedContent-338389Enabled",
+        1,
+    ) == 0
+    show_ext = _reg_get_dword(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+        "HideFileExt",
+        1,
+    ) == 0
+    return [
+        SystemTweak(
+            "high_perf_power",
+            "Схема питания «Высокая производительность»",
+            "Убирает троттлинг частоты процессора при работе от сети.",
+            enabled=_is_high_perf_power(),
+        ),
+        SystemTweak(
+            "disable_bing_search",
+            "Отключить веб-поиск Bing в меню «Пуск»",
+            "Ускоряет локальный поиск программ и файлов без обращения в интернет.",
+            enabled=bing_off,
+        ),
+        SystemTweak(
+            "disable_win_tips",
+            "Отключить рекламные советы и рекомендации Windows",
+            "Убирает навязчивые всплывающие подсказки и рекламу в меню «Пуск».",
+            enabled=tips_off,
+        ),
+        SystemTweak(
+            "show_file_ext",
+            "Показывать расширения всех файлов (.exe, .txt, .json)",
+            "Повышает удобство и защищает от файлов с двойным расширением.",
+            enabled=show_ext,
+        ),
+    ]
+
+
+def set_system_tweak(key: str, enabled: bool) -> tuple[bool, str]:
+    """Переключает выбранную настройку Windows и возвращает (успех, сообщение)."""
+    try:
+        if key == "high_perf_power":
+            target = _GUID_HIGH_PERF if enabled else _GUID_BALANCED
+            ok, detail = _run_cmd(["powercfg", "/setactive", target], timeout=10)
+            return ok, (
+                "Включена схема питания «Высокая производительность»"
+                if enabled and ok
+                else ("Включена сбалансированная схема питания" if ok else detail)
+            )
+        if key == "disable_bing_search":
+            _reg_set_dword(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Policies\Microsoft\Windows\Explorer",
+                "DisableSearchBoxSuggestions",
+                1 if enabled else 0,
+            )
+            return True, "Веб-поиск Bing в меню «Пуск» отключён" if enabled else "Веб-поиск в меню «Пуск» включён"
+        if key == "disable_win_tips":
+            sub = r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+            val = 0 if enabled else 1
+            for name in ("SubscribedContent-338389Enabled", "SoftLandingEnabled", "SystemPaneSuggestionsEnabled"):
+                _reg_set_dword(winreg.HKEY_CURRENT_USER, sub, name, val)
+            return True, "Рекламные рекомендации Windows отключены" if enabled else "Рекомендации Windows включены"
+        if key == "show_file_ext":
+            _reg_set_dword(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+                "HideFileExt",
+                0 if enabled else 1,
+            )
+            return True, "Показ расширений файлов включён" if enabled else "Расширения файлов скрыты"
+    except OSError as exc:
+        return False, str(exc)
+    return False, "Неизвестная настройка"
+
 

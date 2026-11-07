@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import html
 import logging
-import re
+import os
 from pathlib import Path
+import re
+import subprocess
 
-from PySide6.QtCore import QSortFilterProxyModel, Qt, QUrl
+from PySide6.QtCore import QSortFilterProxyModel, Qt, QTimer, QUrl
 from PySide6.QtGui import QCloseEvent, QColor, QDesktopServices, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -23,6 +26,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -34,6 +38,7 @@ from .models import (
     CleanTarget,
     DriverUpdate,
     InstallSummary,
+    LargeFileItem,
     OptimizeResult,
     RegistryFixSummary,
     RegistryIssue,
@@ -41,7 +46,14 @@ from .models import (
     StartupItem,
     SystemReport,
 )
-from .optimizer import estimate_startup_impact, list_startup_items, set_startup_item_enabled
+from .optimizer import (
+    estimate_startup_impact,
+    get_memory_usage,
+    list_startup_items,
+    list_system_tweaks,
+    set_startup_item_enabled,
+    set_system_tweak,
+)
 from .registry_cleaner import extract_executable_path
 from .report import export_html, export_json
 from .theme import ACCENT, APP_STYLESHEET, DANGER, SUCCESS, TEXT_SECONDARY, WARNING
@@ -53,6 +65,7 @@ from .workers import (
     FixRegistryWorker,
     InstallUpdatesWorker,
     OptimizeTaskWorker,
+    ScanLargeFilesWorker,
     ScanRegistryWorker,
     ScanWorker,
     SearchUpdatesWorker,
@@ -61,6 +74,63 @@ from .workers import (
 logger = logging.getLogger(__name__)
 
 APP_TITLE = "OptiSys — диагностика, очистка и оптимизация системы"
+
+_EXTRA_STYLESHEET = f"""
+QMessageBox, QDialog {{
+    background-color: #181f2c;
+    color: #f1f5f9;
+}}
+QMessageBox QLabel {{
+    color: #f1f5f9;
+    font-size: 13px;
+    background: transparent;
+}}
+QMessageBox QPushButton {{
+    background-color: #2563eb;
+    color: #ffffff;
+    border: 1px solid #60a5fa;
+    border-radius: 7px;
+    padding: 6px 18px;
+    min-width: 80px;
+    font-weight: 600;
+}}
+QMessageBox QPushButton:hover {{
+    background-color: #1d4ed8;
+    border-color: #93c5fd;
+}}
+QCheckBox {{
+    color: #f1f5f9;
+    font-size: 13px;
+    font-weight: 600;
+    spacing: 9px;
+    background: transparent;
+}}
+QCheckBox:hover {{
+    color: #60a5fa;
+}}
+QCheckBox::indicator {{
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    border: 2px solid #475569;
+    background-color: #111620;
+}}
+QCheckBox::indicator:hover {{
+    border-color: {ACCENT};
+}}
+QCheckBox::indicator:checked {{
+    background-color: {ACCENT};
+    border-color: #93c5fd;
+}}
+QToolTip {{
+    background-color: #1e293b;
+    color: #f1f5f9;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+}}
+"""
 
 
 def _parse_size_gb(text: str) -> float:
@@ -165,14 +235,25 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.resize(1280, 800)
-        self.setStyleSheet(APP_STYLESHEET)
+        self.setMinimumSize(980, 620)
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            w = min(1240, max(980, int(avail.width() * 0.92)))
+            h = min(780, max(620, int(avail.height() * 0.90)))
+            self.resize(w, h)
+        else:
+            self.resize(1200, 760)
+        self.setStyleSheet(APP_STYLESHEET + _EXTRA_STYLESHEET)
 
         self._report: SystemReport | None = None
         self._updates: list[DriverUpdate] = []
         self._clean_targets: list[CleanTarget] = []
         self._reg_issues: list[RegistryIssue] = []
         self._startup_items: list[StartupItem] = []
+        self._large_files: list[LargeFileItem] = []
+        self._tweak_checks: dict[str, QCheckBox] = {}
+        self._tweak_loading: bool = False
         self._session_freed_bytes: int = 0
         self._startup_loading: bool = False
 
@@ -184,6 +265,7 @@ class MainWindow(QMainWindow):
         self._reg_scan_worker: ScanRegistryWorker | None = None
         self._reg_fix_worker: FixRegistryWorker | None = None
         self._opt_worker: OptimizeTaskWorker | None = None
+        self._large_worker: ScanLargeFilesWorker | None = None
 
         self._tables: dict[str, DataTable] = {}
         self._nav_buttons: dict[str, SidebarButton] = {}
@@ -192,6 +274,16 @@ class MainWindow(QMainWindow):
         self._build_layout()
         self._update_admin_status()
         self._select_page("overview")
+        self._refresh_live_ram()
+        self._ram_timer = QTimer(self)
+        self._ram_timer.setInterval(2500)
+        self._ram_timer.timeout.connect(self._refresh_live_ram)
+        self._ram_timer.start()
+
+        self._search_elapsed_sec: int = 0
+        self._search_ui_timer = QTimer(self)
+        self._search_ui_timer.setInterval(1000)
+        self._search_ui_timer.timeout.connect(self._on_search_timer_tick)
         self.start_scan()
 
     # ---------- Построение интерфейса ----------
@@ -224,7 +316,7 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self) -> QFrame:
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(225)
+        sidebar.setFixedWidth(195)
 
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(10, 16, 10, 14)
@@ -262,9 +354,8 @@ class MainWindow(QMainWindow):
 
         self.status_title = QLabel("Готов к работе")
         self.status_title.setStyleSheet("font-size: 14px; font-weight: 600;")
-        layout.addWidget(self.status_title)
-
-        layout.addStretch(1)
+        self.status_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        layout.addWidget(self.status_title, stretch=1)
 
         self.btn_scan = QPushButton("🔄 Сканировать")
         self.btn_scan.setObjectName("PrimaryBtn")
@@ -294,10 +385,10 @@ class MainWindow(QMainWindow):
         for key, title in (
             ("cpu", "Процессор"),
             ("memory", "Оперативная память"),
-            ("disks", "Накопители и разделы"),
         ):
             self._register_table_page(key, title)
 
+        self._register_page("disks", self._build_disks_page())
         self._register_page("video", self._build_video_page())
 
         for key, title in (
@@ -324,8 +415,10 @@ class MainWindow(QMainWindow):
             btn.set_active(k == key)
         if key in self._page_indices:
             self.stack.setCurrentIndex(self._page_indices[key])
-        if key == "optimize" and not self._startup_items:
-            self.refresh_startup_items()
+        if key == "optimize":
+            if not self._startup_items:
+                self.refresh_startup_items()
+            self.refresh_system_tweaks()
 
     def _any_worker_running(self) -> bool:
         workers = (
@@ -337,6 +430,7 @@ class MainWindow(QMainWindow):
             self._reg_scan_worker,
             self._reg_fix_worker,
             self._opt_worker,
+            self._large_worker,
         )
         return any(w is not None and w.isRunning() for w in workers)
 
@@ -374,26 +468,39 @@ class MainWindow(QMainWindow):
         gauges_card.setObjectName("Card")
         gauges_layout = QVBoxLayout(gauges_card)
         gauges_layout.setContentsMargins(16, 14, 16, 14)
-        g_title = QLabel("Визуальная сводка")
+
+        g_hdr = QHBoxLayout()
+        g_title = QLabel("Визуальная сводка (Live)")
         g_title.setStyleSheet("font-size: 14px; font-weight: 700;")
-        gauges_layout.addWidget(g_title)
+        g_hdr.addWidget(g_title)
+        g_hdr.addStretch(1)
+
+        btn_quick_ram = QPushButton("🧠 Освободить ОЗУ")
+        btn_quick_ram.setObjectName("ActionBtn")
+        btn_quick_ram.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_quick_ram.setToolTip("Мгновенно очистить рабочие наборы фоновых процессов в оперативной памяти")
+        btn_quick_ram.clicked.connect(lambda: self.start_optimize_task("free_ram"))
+        g_hdr.addWidget(btn_quick_ram)
+        gauges_layout.addLayout(g_hdr)
 
         rings_row = QHBoxLayout()
-        rings_row.setSpacing(8)
+        rings_row.setSpacing(6)
+        self.gauge_ram = AnimatedRingGauge("Загрузка ОЗУ", "ожидание…", "#8b5cf6")
         self.gauge_sys_disk = AnimatedRingGauge("Системный диск", "ожидание…", ACCENT)
         self.gauge_all_disks = AnimatedRingGauge("Все разделы", "ожидание…", "#06b6d4")
-        self.gauge_signed = AnimatedRingGauge("Подписанные драйверы", "ожидание…", SUCCESS)
+        self.gauge_signed = AnimatedRingGauge("Подписаны WHQL", "ожидание…", SUCCESS, higher_is_better=True)
+        rings_row.addWidget(self.gauge_ram)
         rings_row.addWidget(self.gauge_sys_disk)
         rings_row.addWidget(self.gauge_all_disks)
         rings_row.addWidget(self.gauge_signed)
         gauges_layout.addLayout(rings_row)
         gauges_layout.addStretch(1)
 
-        mid_row.addWidget(gauges_card, stretch=5)
+        mid_row.addWidget(gauges_card, stretch=6)
 
         overview_table = DataTable(title="Параметры системы")
         self._tables["overview"] = overview_table
-        mid_row.addWidget(overview_table, stretch=6)
+        mid_row.addWidget(overview_table, stretch=5)
 
         layout.addLayout(mid_row, stretch=1)
         return page
@@ -437,6 +544,8 @@ class MainWindow(QMainWindow):
             "🛡 Активные сессии, куки, пароли и файлы моложе 24 ч в %TEMP% защищены."
         )
         lbl_hint.setObjectName("MutedLabel")
+        lbl_hint.setWordWrap(True)
+        lbl_hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
         self.btn_sel_rec = QPushButton("✔ Рекомендуемые")
         self.btn_sel_rec.setObjectName("ActionBtn")
@@ -533,6 +642,7 @@ class MainWindow(QMainWindow):
         q_title.setStyleSheet("font-size: 15px; font-weight: 700;")
         self.opt_status_lbl = QLabel("Выберите действие ниже или нажмите «Ускорить всё в 1 клик»")
         self.opt_status_lbl.setObjectName("MutedLabel")
+        self.opt_status_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
         self.btn_opt_all = QPushButton("🚀 Ускорить всё в 1 клик")
         self.btn_opt_all.setObjectName("AccentPurpleBtn")
@@ -541,8 +651,8 @@ class MainWindow(QMainWindow):
         self.btn_opt_all.clicked.connect(lambda: self.start_optimize_task("all_fast"))
 
         q_hdr.addWidget(q_title)
-        q_hdr.addStretch(1)
-        q_hdr.addWidget(self.opt_status_lbl)
+        q_hdr.addSpacing(12)
+        q_hdr.addWidget(self.opt_status_lbl, stretch=1)
         q_hdr.addSpacing(10)
         q_hdr.addWidget(self.btn_opt_all)
         quick_layout.addLayout(q_hdr)
@@ -557,7 +667,7 @@ class MainWindow(QMainWindow):
                 "flush_dns",
                 "🌐 Ускорение интернета",
                 "Обновляет адреса сайтов. Помогает, если страницы долго загружаются или не открываются.",
-                "Ускорить браузер и сайты",
+                "Ускорить сайты",
                 "PrimaryBtn",
             ),
             (
@@ -565,6 +675,13 @@ class MainWindow(QMainWindow):
                 "📡 Сброс сетевых задержек",
                 "Очищает старые сетевые маршруты роутера для стабильной связи в онлайн-играх и звонках.",
                 "Обновить сеть",
+                "PrimaryBtn",
+            ),
+            (
+                "free_ram",
+                "🧠 Освобождение ОЗУ",
+                "Сбрасывает неиспользуемый кэш фоновых процессов и мгновенно освобождает оперативную память.",
+                "Освободить ОЗУ",
                 "PrimaryBtn",
             ),
             (
@@ -622,6 +739,39 @@ class MainWindow(QMainWindow):
         quick_layout.addWidget(self.opt_progress)
 
         layout.addWidget(quick_card)
+
+        # Компактная панель быстрых переключателей Windows 11
+        tweaks_card = QFrame()
+        tweaks_card.setObjectName("Card")
+        tweaks_layout = QVBoxLayout(tweaks_card)
+        tweaks_layout.setContentsMargins(16, 10, 16, 10)
+        tweaks_layout.setSpacing(6)
+
+        tw_hdr = QHBoxLayout()
+        tw_title = QLabel("⚙ Быстрые настройки Windows 11 (в 1 клик)")
+        tw_title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        self.tweak_status_lbl = QLabel("Изменения применяются мгновенно и безопасно")
+        self.tweak_status_lbl.setObjectName("MutedLabel")
+        tw_hdr.addWidget(tw_title)
+        tw_hdr.addStretch(1)
+        tw_hdr.addWidget(self.tweak_status_lbl)
+        tweaks_layout.addLayout(tw_hdr)
+
+        tw_grid = QGridLayout()
+        tw_grid.setSpacing(8)
+        for idx, tw in enumerate(list_system_tweaks()):
+            chk = QCheckBox(tw.title)
+            chk.setToolTip(tw.description)
+            chk.setStyleSheet("color: #f1f5f9; font-size: 13px; font-weight: 600;")
+            chk.setCursor(Qt.CursorShape.PointingHandCursor)
+            chk.setChecked(tw.enabled)
+            chk.toggled.connect(lambda checked, k=tw.key: self._on_tweak_toggled(k, checked))
+            self._tweak_checks[tw.key] = chk
+            tw_grid.addWidget(chk, idx // 2, idx % 2)
+        tw_grid.setColumnStretch(0, 1)
+        tw_grid.setColumnStretch(1, 1)
+        tweaks_layout.addLayout(tw_grid)
+        layout.addWidget(tweaks_card)
 
         # Нижний сплит: слева Исправление ошибок Windows (Реестр), справа Программы при включении (Автозагрузка)
         split = QHBoxLayout()
@@ -729,6 +879,93 @@ class MainWindow(QMainWindow):
         layout.addLayout(split, stretch=1)
         return page
 
+    # ---------- Страница «Диски» + Поиск крупных файлов ----------
+
+    def _build_disks_page(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        table = DataTable(title="Накопители, разделы и S.M.A.R.T.-статус")
+        self._tables["disks"] = table
+        layout.addWidget(table, stretch=2)
+
+        lf_card = QFrame()
+        lf_card.setObjectName("Card")
+        lf_layout = QVBoxLayout(lf_card)
+        lf_layout.setContentsMargins(16, 12, 16, 12)
+        lf_layout.setSpacing(8)
+
+        lf_hdr = QHBoxLayout()
+        lf_title = QLabel("📦 Поиск крупных файлов («Пожиратели места» > 100 МБ)")
+        lf_title.setStyleSheet("font-size: 14px; font-weight: 700;")
+        self.lf_status_lbl = QLabel(
+            "Быстрый поиск забытых установщиков, архивов, видео и образов в папках пользователя"
+        )
+        self.lf_status_lbl.setObjectName("MutedLabel")
+
+        self.btn_lf_scan = QPushButton("🔍 Найти крупные файлы")
+        self.btn_lf_scan.setObjectName("PrimaryBtn")
+        self.btn_lf_scan.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_lf_scan.clicked.connect(self.start_scan_large_files)
+
+        self.btn_lf_open = QPushButton("📂 Показать в папке")
+        self.btn_lf_open.setObjectName("ActionBtn")
+        self.btn_lf_open.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_lf_open.setEnabled(False)
+        self.btn_lf_open.clicked.connect(self._reveal_selected_large_file)
+
+        self.btn_lf_del = QPushButton("🗑 Удалить файл")
+        self.btn_lf_del.setObjectName("ActionBtn")
+        self.btn_lf_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_lf_del.setEnabled(False)
+        self.btn_lf_del.clicked.connect(self._delete_selected_large_file)
+
+        lf_hdr.addWidget(lf_title)
+        lf_hdr.addStretch(1)
+        lf_hdr.addWidget(self.btn_lf_scan)
+        lf_hdr.addWidget(self.btn_lf_open)
+        lf_hdr.addWidget(self.btn_lf_del)
+        lf_layout.addLayout(lf_hdr)
+
+        lf_info_row = QHBoxLayout()
+        lf_info_row.setSpacing(12)
+        self.lf_status_lbl.setWordWrap(True)
+        self.lf_hint_lbl = QLabel(
+            "🟢 Безопасно удалить — кэш и установщики   ·   "
+            "🟡 Проверить — личные файлы и моды   ·   "
+            "🔴 Не трогать — файлы программ и диски WSL/Docker"
+        )
+        self.lf_hint_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+        self.lf_hint_lbl.setWordWrap(True)
+        lf_info_row.addWidget(self.lf_status_lbl)
+        lf_info_row.addStretch(1)
+        lf_info_row.addWidget(self.lf_hint_lbl)
+        lf_layout.addLayout(lf_info_row)
+
+        self.lf_model = QStandardItemModel(self)
+        self.lf_model.setHorizontalHeaderLabels(
+            ["Файл", "Размер", "Безопасность удаления", "Что это и можно ли удалять", "Папка"]
+        )
+        self.lf_view = QTableView()
+        self.lf_view.setModel(self.lf_model)
+        self.lf_view.setAlternatingRowColors(True)
+        self.lf_view.setShowGrid(False)
+        self.lf_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.lf_view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.lf_view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.lf_view.verticalHeader().setVisible(False)
+        self.lf_view.verticalHeader().setDefaultSectionSize(34)
+        self.lf_view.horizontalHeader().setStretchLastSection(True)
+        self.lf_view.horizontalHeader().setHighlightSections(False)
+        self.lf_view.selectionModel().selectionChanged.connect(lambda *_: self._on_large_file_selected())
+        self.lf_view.doubleClicked.connect(lambda _: self._reveal_selected_large_file())
+        lf_layout.addWidget(self.lf_view, stretch=1)
+
+        layout.addWidget(lf_card, stretch=3)
+        return w
+
     # ---------- Страница «Видео» ----------
 
     def _build_video_page(self) -> QWidget:
@@ -778,10 +1015,20 @@ class MainWindow(QMainWindow):
         self.btn_elevate.setObjectName("ActionBtn")
         self.btn_elevate.clicked.connect(self._relaunch_admin)
 
+        self.search_timer_lbl = QLabel("")
+        self.search_timer_lbl.setStyleSheet(f"color: {ACCENT}; font-size: 13px; font-weight: 700;")
+        self.search_timer_lbl.hide()
+
         self.btn_search = QPushButton("🔍 Проверить обновления (Windows Update)")
         self.btn_search.setObjectName("PrimaryBtn")
         self.btn_search.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_search.clicked.connect(self.start_search_updates)
+
+        self.btn_cancel_search = QPushButton("✖ Отменить поиск")
+        self.btn_cancel_search.setObjectName("ActionBtn")
+        self.btn_cancel_search.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cancel_search.hide()
+        self.btn_cancel_search.clicked.connect(self.cancel_search_updates)
 
         self.btn_install = QPushButton("⬇ Установить выбранные")
         self.btn_install.setObjectName("ActionBtn")
@@ -792,7 +1039,9 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.admin_label)
         top_layout.addWidget(self.btn_elevate)
         top_layout.addStretch(1)
+        top_layout.addWidget(self.search_timer_lbl)
         top_layout.addWidget(self.btn_search)
+        top_layout.addWidget(self.btn_cancel_search)
         top_layout.addWidget(self.btn_install)
         layout.addWidget(top_card)
 
@@ -874,17 +1123,29 @@ class MainWindow(QMainWindow):
         self.status_title.setText("Ошибка сканирования")
         QMessageBox.critical(self, "Ошибка", message)
 
+    def _refresh_live_ram(self) -> None:
+        pct, used_gb, total_gb = get_memory_usage()
+        if total_gb > 0:
+            self.gauge_ram.set_data(
+                pct,
+                "Оперативная память",
+                f"Занято {used_gb:.1f} из {total_gb:.1f} ГБ",
+            )
+
     def _update_dashboard(self, report: SystemReport) -> None:
         ov_map = dict(row[:2] for row in (report.section("overview").rows if report.section("overview") else []) if len(row) >= 2)
         cpu_map = dict(row[:2] for row in (report.section("cpu").rows if report.section("cpu") else []) if len(row) >= 2)
 
-        self.card_os.set_content(
-            ov_map.get("ОС", "Windows"),
-            f"{ov_map.get('Имя компьютера', '')} · Сборка {ov_map.get('Сборка', '—')}",
-        )
+        bat_charge = ov_map.get("Заряд батареи", "")
+        os_sub = f"{ov_map.get('Имя компьютера', '')} · Сборка {ov_map.get('Сборка', '—')}"
+        if bat_charge:
+            os_sub += f" · 🔋 {bat_charge.split(' ')[0]}"
+        self.card_os.set_content(ov_map.get("ОС", "Windows"), os_sub)
+
+        freq = cpu_map.get("Базовая частота, МГц") or cpu_map.get("Макс. частота, МГц", "—")
         self.card_cpu.set_content(
             cpu_map.get("Модель", "—"),
-            f"Ядер: {cpu_map.get('Ядра', '—')} · Потоков: {cpu_map.get('Потоки', '—')} · {cpu_map.get('Макс. частота, МГц', '—')} МГц",
+            f"Ядер: {cpu_map.get('Ядра', '—')} · Потоков: {cpu_map.get('Потоки', '—')} · {freq} МГц",
         )
         if report.gpus:
             g0 = report.gpus[0]
@@ -910,7 +1171,7 @@ class MainWindow(QMainWindow):
             self.gauge_sys_disk.set_data(
                 c_used_pct,
                 f"Диск {c_disk[0]}",
-                f"Свободно {c_disk[4]} из {c_disk[3]}",
+                f"Своб. {c_free:.0f} из {c_total:.0f} ГБ",
             )
 
             all_total = sum(_parse_size_gb(r[3]) for r in logical)
@@ -1420,7 +1681,7 @@ class MainWindow(QMainWindow):
         self.status_title.setText("Выполняется оптимизация компьютера…")
 
         if task_key == "all_fast":
-            for k in ("flush_dns", "arp_net_cache", "trim_ssd"):
+            for k in ("flush_dns", "arp_net_cache", "free_ram", "trim_ssd"):
                 if k in self._opt_card_status:
                     self._opt_card_status[k].setText("⏳ Выполняется…")
                     self._opt_card_status[k].setStyleSheet(f"color: {ACCENT}; font-size: 11px; font-weight: 600;")
@@ -1447,8 +1708,9 @@ class MainWindow(QMainWindow):
         self.opt_status_lbl.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
         self.status_title.setText(f"{res.title}: {res.message}")
 
+        self._refresh_live_ram()
         if res.key == "all_fast":
-            for k in ("flush_dns", "arp_net_cache", "trim_ssd"):
+            for k in ("flush_dns", "arp_net_cache", "free_ram", "trim_ssd"):
                 if k in self._opt_card_status:
                     self._opt_card_status[k].setText("✔ Выполнено")
                     self._opt_card_status[k].setStyleSheet(f"color: {SUCCESS}; font-size: 11px; font-weight: 600;")
@@ -1462,6 +1724,158 @@ class MainWindow(QMainWindow):
         self.opt_progress.hide()
         self.opt_status_lbl.setText(f"Ошибка: {message}")
         QMessageBox.warning(self, "Оптимизация", message)
+
+    def refresh_system_tweaks(self) -> None:
+        self._tweak_loading = True
+        try:
+            for tw in list_system_tweaks():
+                chk = self._tweak_checks.get(tw.key)
+                if chk is not None:
+                    chk.setChecked(tw.enabled)
+        finally:
+            self._tweak_loading = False
+
+    def _on_tweak_toggled(self, key: str, enabled: bool) -> None:
+        if self._tweak_loading:
+            return
+        ok, msg = set_system_tweak(key, enabled)
+        color = SUCCESS if ok else WARNING
+        self.tweak_status_lbl.setText(f"{'✔' if ok else '⚠'} {msg}")
+        self.tweak_status_lbl.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
+        self.status_title.setText(msg)
+        if not ok:
+            self.refresh_system_tweaks()
+
+    # ---------- Поиск крупных файлов ----------
+
+    def start_scan_large_files(self) -> None:
+        if self._large_worker and self._large_worker.isRunning():
+            return
+        self.btn_lf_scan.setEnabled(False)
+        self.btn_lf_open.setEnabled(False)
+        self.btn_lf_del.setEnabled(False)
+        self.spinner.start()
+        self.lf_status_lbl.setText("⏳ Поиск файлов крупнее 100 МБ в папках пользователя…")
+
+        self._large_worker = ScanLargeFilesWorker(100)
+        self._large_worker.succeeded.connect(self._on_large_files_done)
+        self._large_worker.failed.connect(lambda m: QMessageBox.warning(self, "Крупные файлы", m))
+        self._large_worker.finished.connect(self._on_large_files_finished)
+        self._large_worker.start()
+
+    def _on_large_files_finished(self) -> None:
+        self.btn_lf_scan.setEnabled(True)
+        self._stop_spinner_if_idle()
+
+    def _on_large_files_done(self, items: list[LargeFileItem]) -> None:
+        self._large_files = items
+        self.lf_model.removeRows(0, self.lf_model.rowCount())
+        total_bytes = sum(it.size_bytes for it in items)
+        safe_bytes = sum(it.size_bytes for it in items if it.safety_level == "safe")
+        level_colors = {"safe": SUCCESS, "review": WARNING, "danger": DANGER}
+        for idx, it in enumerate(items):
+            name_item = QStandardItem(it.name)
+            name_item.setData(idx, Qt.ItemDataRole.UserRole)
+            sz_item = QStandardItem(fmt_bytes(it.size_bytes))
+            sz_item.setForeground(QColor(WARNING if it.size_bytes >= 1024**3 else ACCENT))
+            badge_item = QStandardItem(it.safety_badge)
+            badge_item.setForeground(QColor(level_colors.get(it.safety_level, TEXT_SECONDARY)))
+            desc_item = QStandardItem(it.description)
+            dir_item = QStandardItem(it.folder)
+            tooltip = f"{it.safety_badge}\n{it.description}\n\nПуть: {it.path}\nИзменён: {it.modified_str}"
+            for cell in (name_item, sz_item, badge_item, desc_item, dir_item):
+                cell.setToolTip(tooltip)
+            self.lf_model.appendRow([name_item, sz_item, badge_item, desc_item, dir_item])
+        self.lf_view.setColumnWidth(0, 210)
+        self.lf_view.setColumnWidth(1, 90)
+        self.lf_view.setColumnWidth(2, 250)
+        self.lf_view.setColumnWidth(3, 390)
+        has_items = bool(items)
+        self.btn_lf_open.setEnabled(has_items)
+        self.btn_lf_del.setEnabled(has_items)
+        if has_items:
+            safe_txt = f" (можно безопасно очистить: {fmt_bytes(safe_bytes)})" if safe_bytes > 0 else ""
+            self.lf_status_lbl.setText(
+                f"Найдено файлов: {len(items)} на сумму {fmt_bytes(total_bytes)}{safe_txt}"
+            )
+            self.lf_status_lbl.setStyleSheet(f"color: {ACCENT}; font-size: 12px; font-weight: 600;")
+        else:
+            self.lf_status_lbl.setText("✔ Крупных файлов (> 100 МБ) в пользовательских папках не обнаружено")
+            self.lf_status_lbl.setStyleSheet(f"color: {SUCCESS}; font-size: 12px; font-weight: 600;")
+
+    def _on_large_file_selected(self) -> None:
+        target = self._selected_large_file()
+        if not target:
+            return
+        level_colors = {"safe": SUCCESS, "review": WARNING, "danger": DANGER}
+        color = level_colors.get(target.safety_level, TEXT_SECONDARY)
+        self.lf_hint_lbl.setText(f"{target.safety_badge}: {target.description}")
+        self.lf_hint_lbl.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
+        self.btn_lf_del.setEnabled(target.safety_level != "danger")
+        self.btn_lf_del.setText(
+            "🔒 Удаление заблокировано (нужен системе)" if target.safety_level == "danger" else "🗑 Удалить файл"
+        )
+
+    def _selected_large_file(self) -> LargeFileItem | None:
+        indexes = self.lf_view.selectionModel().selectedRows() if self.lf_view.selectionModel() else []
+        if not indexes:
+            return None
+        it = self.lf_model.item(indexes[0].row(), 0)
+        if not it:
+            return None
+        idx = it.data(Qt.ItemDataRole.UserRole)
+        if idx is not None and 0 <= int(idx) < len(self._large_files):
+            return self._large_files[int(idx)]
+        return None
+
+    def _reveal_selected_large_file(self) -> None:
+        target = self._selected_large_file()
+        if not target:
+            return
+        subprocess.Popen(["explorer.exe", f"/select,{target.path}"])
+
+    def _delete_selected_large_file(self) -> None:
+        target = self._selected_large_file()
+        if not target:
+            return
+        if target.safety_level == "danger":
+            QMessageBox.warning(
+                self,
+                "Удаление запрещено для защиты системы",
+                f"{target.safety_badge}\n\n{target.description}\n\n"
+                "Этот файл необходим для работы установленной программы или виртуальной среды.",
+            )
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Подтверждение удаления файла")
+        box.setIcon(QMessageBox.Icon.Question)
+        badge_color = SUCCESS if target.safety_level == "safe" else WARNING
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            f"<div style='font-size:14px; font-weight:700; color:#f1f5f9; margin-bottom:6px;'>"
+            f"Удалить файл «{html.escape(target.name)}» ({fmt_bytes(target.size_bytes)})?"
+            f"</div>"
+            f"<div style='color:{badge_color}; font-weight:700; margin-bottom:6px;'>"
+            f"{html.escape(target.safety_badge)}"
+            f"</div>"
+            f"<div style='color:#cbd5e1; margin-bottom:8px;'>"
+            f"{html.escape(target.description)}"
+            f"</div>"
+            f"<div style='color:#94a3b8; font-size:11px;'>"
+            f"Папка: {html.escape(target.folder)}"
+            f"</div>"
+        )
+        btn_yes = box.addButton("🗑 Удалить файл", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() != btn_yes:
+            return
+        try:
+            os.remove(target.path)
+            self.status_title.setText(f"Удалён файл {target.name} (+{fmt_bytes(target.size_bytes)})")
+            self.start_scan_large_files()
+        except OSError as exc:
+            QMessageBox.warning(self, "Не удалось удалить файл", str(exc))
 
     # ---------- Экспорт ----------
 
@@ -1490,23 +1904,61 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "UAC", "Не удалось запросить права администратора")
 
+    def _on_search_timer_tick(self) -> None:
+        self._search_elapsed_sec += 1
+        mm, ss = divmod(self._search_elapsed_sec, 60)
+        time_str = f"{mm:02d}:{ss:02d}"
+        self.search_timer_lbl.setText(f"⏱ Время поиска: {time_str}")
+        # Плавная пульсация полосы (Qt рисует текст внутри QProgressBar только при maximum > 0)
+        pulse_val = 20 + (self._search_elapsed_sec * 12) % 75
+        self.progress.setValue(pulse_val)
+        self.progress.setFormat(f"Поиск обновлений в каталоге Windows Update… ({time_str})")
+
     def start_search_updates(self) -> None:
         self.btn_search.setEnabled(False)
+        self.btn_cancel_search.setEnabled(True)
+        self.btn_cancel_search.show()
         self.btn_install.setEnabled(False)
         self.spinner.start()
-        self.progress.setRange(0, 0)
-        self.progress.setFormat("Поиск обновлений в каталоге Windows Update…")
+
+        self._search_elapsed_sec = 0
+        self.search_timer_lbl.setText("⏱ Время поиска: 00:00")
+        self.search_timer_lbl.show()
+        self._search_ui_timer.start()
+
+        self.progress.setRange(0, 100)
+        self.progress.setValue(20)
+        self.progress.setFormat("Поиск обновлений в каталоге Windows Update… (00:00)")
         self.progress.show()
         self._log("Запущен поиск обновлений драйверов через Windows Update…")
 
         self._search_worker = SearchUpdatesWorker()
         self._search_worker.succeeded.connect(self._on_search_done)
+        self._search_worker.cancelled.connect(self._on_search_cancelled)
         self._search_worker.failed.connect(self._on_updates_failed)
         self._search_worker.finished.connect(self._on_search_finished)
         self._search_worker.start()
 
+    def cancel_search_updates(self) -> None:
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_ui_timer.stop()
+            self.btn_cancel_search.setEnabled(False)
+            self.search_timer_lbl.setText("⏱ Отмена поиска…")
+            self.progress.setFormat("Отмена поиска Windows Update…")
+            self._search_worker.cancel()
+
+    def _on_search_cancelled(self) -> None:
+        self._search_ui_timer.stop()
+        self.search_timer_lbl.hide()
+        self.progress.hide()
+        self._log(f"Поиск обновлений отменён пользователем (прошло {self._search_elapsed_sec} с).")
+        self.status_title.setText("Поиск обновлений отменён")
+
     def _on_search_finished(self) -> None:
+        self._search_ui_timer.stop()
+        self.search_timer_lbl.hide()
         self.btn_search.setEnabled(True)
+        self.btn_cancel_search.hide()
         self._stop_spinner_if_idle()
 
     def _on_search_done(self, updates: list[DriverUpdate]) -> None:
@@ -1601,6 +2053,8 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_worker.cancel()
         for worker in (
             self._scan_worker,
             self._search_worker,
@@ -1608,6 +2062,7 @@ class MainWindow(QMainWindow):
             self._reg_scan_worker,
             self._reg_fix_worker,
             self._opt_worker,
+            self._large_worker,
         ):
             if worker and worker.isRunning():
                 self.status_title.setText("Завершение фоновых операций…")
