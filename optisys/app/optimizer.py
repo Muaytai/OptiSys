@@ -175,15 +175,13 @@ def run_optimization_task(key: str) -> OptimizeResult:
         msg = "Адреса сайтов обновлены — страницы будут открываться быстрее" if ok else "Не удалось обновить кэш адресов"
         return OptimizeResult(key, "Ускорение интернета и открытия сайтов", ok, msg)
     if key == "arp_net_cache":
-        ok1, _ = _run_cmd(["ipconfig", "/flushdns"], timeout=30)
-        ok2, _ = _run_cmd(["netsh", "interface", "ip", "delete", "arpcache"], timeout=30)
-        ok = ok1 and ok2
+        ok, _ = _run_cmd(["ipconfig", "/flushdns"], timeout=30)
         msg = (
-            "Сетевые маршруты успешно сброшены и обновлены"
+            "Сетевой кэш DNS успешно обновлён — стабильность связи сохранена"
             if ok
-            else "Для полного сброса сетевых маршрутов запустите программу от имени администратора"
+            else "Не удалось обновить сетевой кэш"
         )
-        return OptimizeResult(key, "Сброс сетевых задержек и маршрутов", ok, msg)
+        return OptimizeResult(key, "Сброс сетевых задержек (DNS)", ok, msg)
     if key == "free_ram":
         trimmed, freed_bytes = free_memory_working_sets()
         freed_str = fmt_bytes(freed_bytes) if freed_bytes > 1024 * 1024 else "кэш уже оптимален"
@@ -216,13 +214,10 @@ def run_optimization_task(key: str) -> OptimizeResult:
         return OptimizeResult(key, "Очистка старых копий обновлений Windows", ok, msg)
     if key == "all_fast":
         ok_dns, _ = _run_cmd(["ipconfig", "/flushdns"], timeout=30)
-        ok_arp, _ = _run_cmd(["netsh", "interface", "ip", "delete", "arpcache"], timeout=30)
         _run_cmd(["fsutil", "behavior", "set", "DisableDeleteNotify", "0"], timeout=15)
         ok_ssd, _ = _run_cmd(["defrag", sys_drive, "/L"], timeout=120)
         _, freed_ram = free_memory_working_sets()
-        done_parts = ["интернет"]
-        if ok_arp:
-            done_parts.append("сеть")
+        done_parts = ["сеть и DNS"]
         if ok_ssd:
             done_parts.append(f"диск {sys_drive}")
         if freed_ram > 1024 * 1024:
@@ -266,9 +261,97 @@ def get_memory_usage() -> tuple[float, float, float]:
     return float(stat.dwMemoryLoad), used_gb, total_gb
 
 
-def free_memory_working_sets() -> tuple[int, int]:
-    """Сбрасывает неиспользуемые рабочие наборы фоновых процессов (EmptyWorkingSet).
+# Процессы, выгрузка памяти которых опасна для сетевого стека, VPN и стабильности Windows
+_PROTECTED_PROCESS_NAMES: frozenset[str] = frozenset(
+    {
+        # Системное ядро и критические службы Windows
+        "system",
+        "registry",
+        "smss.exe",
+        "csrss.exe",
+        "wininit.exe",
+        "services.exe",
+        "lsass.exe",
+        "lsaiso.exe",
+        "svchost.exe",
+        "dwm.exe",
+        "winlogon.exe",
+        "fontdrvhost.exe",
+        "sihost.exe",
+        "explorer.exe",
+        "taskhostw.exe",
+        "spoolsv.exe",
+        "wudfhost.exe",
+        "searchindexer.exe",
+        "audiodg.exe",
+        "securityhealthservice.exe",
+        "securityhealthsystray.exe",
+        "msmpeng.exe",
+        "nissrv.exe",
+        "ctfmon.exe",
+        "conhost.exe",
+        # Сетевые службы, VPN, прокси, туннели и DNS
+        "ag_dns.exe",
+        "hiddify.exe",
+        "hiddifyadmin.exe",
+        "sing-box.exe",
+        "wintun.exe",
+        "openvpn.exe",
+        "wireguard.exe",
+        "clash.exe",
+        "clash-meta.exe",
+        "mihomo.exe",
+        "v2ray.exe",
+        "xray.exe",
+        "nekoray.exe",
+        "nekobox.exe",
+        "tun2socks.exe",
+        "goodbyedpi.exe",
+        "zapret.exe",
+        "tailscale.exe",
+        "zerotier-one_x64.exe",
+    }
+)
 
+_VPN_OR_NET_SUBSTRINGS: tuple[str, ...] = (
+    "vpn",
+    "proxy",
+    "tunnel",
+    "wintun",
+    "sing-box",
+    "clash",
+    "wireguard",
+    "openvpn",
+    "v2ray",
+    "xray",
+    "shadowsocks",
+    "dns",
+)
+
+
+def _get_process_name(handle: int) -> str:
+    buf = ctypes.create_unicode_buffer(512)
+    size = wintypes.DWORD(512)
+    if ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+        return Path(buf.value).name.lower()
+    return ""
+
+
+def _is_safe_to_trim(proc_name: str) -> bool:
+    if not proc_name:
+        return False
+    low = proc_name.lower().strip()
+    if low in _PROTECTED_PROCESS_NAMES:
+        return False
+    if any(m in low for m in _VPN_OR_NET_SUBSTRINGS):
+        return False
+    return True
+
+
+def free_memory_working_sets() -> tuple[int, int]:
+    """Сбрасывает неиспользуемые рабочие наборы фоновых пользовательских приложений (EmptyWorkingSet).
+
+    Системные службы Windows, сеть, DNS и VPN-туннели безопасно исключаются.
     Возвращает (число_процессов, освобождено_байт).
     """
     stat_before = _MEMORYSTATUSEX()
@@ -282,7 +365,8 @@ def free_memory_working_sets() -> tuple[int, int]:
 
     count = cb_needed.value // ctypes.sizeof(wintypes.DWORD)
     current_pid = os.getpid()
-    access = 0x0400 | 0x0100  # PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA
+    # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) | PROCESS_SET_QUOTA (0x0100)
+    access = 0x1000 | 0x0100
     trimmed = 0
     for i in range(count):
         pid = int(arr[i])
@@ -291,6 +375,9 @@ def free_memory_working_sets() -> tuple[int, int]:
         handle = ctypes.windll.kernel32.OpenProcess(access, False, pid)
         if handle:
             try:
+                proc_name = _get_process_name(handle)
+                if not _is_safe_to_trim(proc_name):
+                    continue
                 if ctypes.windll.psapi.EmptyWorkingSet(handle):
                     trimmed += 1
             finally:
